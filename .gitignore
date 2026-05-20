@@ -1,0 +1,35 @@
+# --- runtime data (lives outside the repo by default; see research_mcp/paths.py) ---
+*.db
+*.db-shm
+*.db-wal
+*.db.backup-*
+downloads/
+
+# --- run-time logs and progress files ---
+*.log
+backfill_*.json
+retraction_refresh_progress.json
+*.csv
+
+# --- Python build / cache ---
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# --- editor / OS noise ---
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# --- ad-hoc working dirs ---
+.planning/
+
+# --- but DO commit our example configs ---
+!examples/*.json

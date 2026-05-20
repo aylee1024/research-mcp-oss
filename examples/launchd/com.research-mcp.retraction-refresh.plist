@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Weekly OpenAlex retraction sync via launchd (macOS).
+
+    To install:
+      1. Replace {{UV_BIN}} with the absolute path to `uv` on your system
+         (run `which uv`).
+      2. Replace {{REPO_PATH}} with the absolute path to your research-mcp
+         clone (e.g. /Users/yourname/Code/research-mcp-oss).
+      3. Replace {{LOG_PATH}} with where you want logs (e.g.
+         /Users/yourname/Library/Logs/research-mcp/retraction.log).
+         Make sure the directory exists.
+      4. Replace {{HOMEBREW_PATH}} with your Homebrew prefix (typically
+         /opt/homebrew on Apple Silicon, /usr/local on Intel).
+      5. Copy this file to ~/Library/LaunchAgents/
+      6. Run: launchctl load ~/Library/LaunchAgents/com.research-mcp.retraction-refresh.plist
+
+    The job fires every Sunday at 03:00 local time.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.research-mcp.retraction-refresh</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{UV_BIN}}</string>
+        <string>run</string>
+        <string>{{REPO_PATH}}/acquire/retraction_refresh.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{{REPO_PATH}}</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>{{LOG_PATH}}</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{LOG_PATH}}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{HOMEBREW_PATH}}/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,18 @@
+{
+  "_comment": "Replace the placeholders (/ABSOLUTE/PATH/... and the email values) with your own. Drop everything inside `env` if you do not want to pin those keys here; the server reads them from your shell environment by default. Remove this `_comment` field before saving — Claude Code does not strip unknown fields.",
+  "mcpServers": {
+    "research-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "/ABSOLUTE/PATH/TO/research-mcp-oss/server.py"
+      ],
+      "env": {
+        "RESEARCH_MCP_HOME": "${HOME}/.local/share/research-mcp",
+        "S2_API_KEY": "REPLACE_OR_REMOVE",
+        "OPENALEX_MAILTO": "REPLACE_OR_REMOVE",
+        "UNPAYWALL_EMAIL": "REPLACE_OR_REMOVE"
+      }
+    }
+  }
+}

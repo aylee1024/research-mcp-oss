@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "research-mcp"
+version = "0.1.0"
+description = "A local academic paper library exposed as Model Context Protocol tools. Find papers, locate passages, verify citations before you cite them."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["mcp", "rag", "academic-papers", "sqlite-vec", "citations", "claude-code"]
+authors = [{ name = "Andrew Lee" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Text Processing :: Indexing",
+    "Typing :: Typed",
+]
+dependencies = [
+    "mcp[cli]",
+    "httpx",
+    "sqlite-vec",
+    "sentence-transformers",
+    "numpy",
+    "einops",
+    "torch",
+]
+
+[project.optional-dependencies]
+# Apple Silicon Metal acceleration for embeddings + reranking.
+mlx = ["mlx", "mlx-embeddings"]
+# PDF processing pipeline. Docling is large; pull it in only if you need
+# `process_pdf` and `acquire_batch`.
+pdf = ["docling", "pymupdf", "pdfplumber"]
+# Everything (recommended for first install).
+all = [
+    "mlx ; platform_machine == 'arm64' and sys_platform == 'darwin'",
+    "mlx-embeddings ; platform_machine == 'arm64' and sys_platform == 'darwin'",
+    "docling",
+    "pymupdf",
+    "pdfplumber",
+]
+
+[project.urls]
+Homepage = "https://github.com/aylee1024/research-mcp-oss"
+Repository = "https://github.com/aylee1024/research-mcp-oss"
+Issues = "https://github.com/aylee1024/research-mcp-oss/issues"
+
+# NOTE: no [project.scripts] entry in v0.1.0. The server is invoked via
+# `uv run server.py` from a git clone. When the project is packaged for
+# PyPI (v0.2), `server.py` will move under `research_mcp/` and a
+# `research-mcp` console script will land here.
+
+[tool.hatch.build.targets.wheel]
+packages = ["research_mcp"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+ignore = ["E501"]  # line-length handled by formatter
