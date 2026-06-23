@@ -75,6 +75,15 @@ from server import (
     PAPERS_DIR,
     DB_PATH,
     _s2_search_throttle,
+    # Relocated to server.py 2026-06-23 so the live download_paper tool shares
+    # the same title->DOI cascade. Imported back here (acquire_batch -> server,
+    # no cycle) so existing call sites are unchanged.
+    _s2_title_match,
+    _resolve_doi_by_title,
+    _normalize_doi_value,
+    _title_similarity,
+    _openalex_throttle,
+    _crossref_throttle,
 )
 
 # Back-compat local alias: the helper lives in server.py now so process_inbox.py
@@ -137,110 +146,6 @@ async def _s2_batch_lookup(client: httpx.AsyncClient, ids: list[str]) -> list[di
     return resp.json()
 
 
-async def _s2_title_match(client: httpx.AsyncClient, title: str) -> tuple[dict | None, float]:
-    """GET /paper/search/match — returns (paper_dict, score) or (None, 0)."""
-    await _s2_search_throttle.wait()
-    headers = {"x-api-key": S2_API_KEY} if S2_API_KEY else {}
-    try:
-        resp = await client.get(
-            f"{S2_BASE}/paper/search/match",
-            params={"query": title, "fields": DEFAULT_FIELDS},
-            headers=headers,
-            timeout=30,
-        )
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            return None, 0.0
-        raise
-    data = resp.json()
-    paper = data.get("data", [{}])[0] if data.get("data") else data
-    score = float(data.get("matchScore") or paper.get("matchScore") or 0)
-    return paper, score
-
-
-def _title_similarity(query: str, candidate: str) -> float:
-    """Bidirectional Jaccard-like similarity between two titles.
-
-    Returns the minimum of (forward containment, reverse containment) so a
-    query matches only when both directions have substantial overlap.
-
-    One-sided containment was unsafe: a short query trivially scored 1.0
-    against any longer candidate that contained it, including distinct
-    papers in the same series.
-    """
-    def words(t: str) -> set[str]:
-        return set(re.sub(r"[^\w\s]", "", t.lower()).split()) - {
-            "the", "a", "an", "of", "and", "in", "on", "for", "to", "with",
-        }
-    wq, wc = words(query), words(candidate)
-    if not wq or not wc:
-        return 0.0
-    shared = len(wq & wc)
-    fwd = shared / len(wq)
-    rev = shared / len(wc)
-    return min(fwd, rev)
-
-
-async def _resolve_doi_by_title(
-    client: httpx.AsyncClient,
-    title: str,
-    year: int | None = None,
-) -> tuple[str | None, str | None]:
-    """Resolve a title to a DOI via three cascading sources.
-
-    Returns (doi, source_name) where source_name is "s2", "openalex", "crossref",
-    or None if nothing is found with sufficient confidence.
-    """
-    normalized_title = (title or "").strip()
-    if len(normalized_title) < 10:
-        return None, None
-
-    try:
-        paper, score = await _s2_title_match(client, normalized_title)
-        if paper and score >= 0.5:
-            doi = _normalize_doi_value((paper.get("externalIds") or {}).get("DOI"))
-            if doi:
-                return doi, "s2"
-    except Exception:
-        pass
-
-    try:
-        params: dict[str, str | int] = {"search": normalized_title, "per_page": 3}
-        if year is not None:
-            params["filter"] = f"publication_year:{year}"
-        await _openalex_throttle.wait()
-        resp = await client.get("https://api.openalex.org/works", params=params, timeout=30)
-        resp.raise_for_status()
-        work = (resp.json().get("results") or [None])[0]
-        if isinstance(work, dict):
-            candidate_title = (work.get("title") or "").strip()
-            doi = _normalize_doi_value(work.get("doi"))
-            if doi and _title_similarity(normalized_title, candidate_title) >= 0.85:
-                return doi, "openalex"
-    except Exception:
-        pass
-
-    try:
-        params = {"query.title": normalized_title, "rows": 3}
-        if year is not None:
-            params["filter"] = f"from-pub-date:{year}-01-01,until-pub-date:{year}-12-31"
-        await _crossref_throttle.wait()
-        resp = await client.get("https://api.crossref.org/works", params=params, timeout=30)
-        resp.raise_for_status()
-        item = ((resp.json().get("message") or {}).get("items") or [None])[0]
-        if isinstance(item, dict):
-            titles = item.get("title") or []
-            candidate_title = titles[0].strip() if titles else ""
-            doi = _normalize_doi_value(item.get("DOI"))
-            if doi and _title_similarity(normalized_title, candidate_title) >= 0.85:
-                return doi, "crossref"
-    except Exception:
-        pass
-
-    return None, None
-
-
 # ---------------------------------------------------------------------------
 # Result parsing helpers
 # ---------------------------------------------------------------------------
@@ -249,15 +154,6 @@ async def _resolve_doi_by_title(
 def _parse_orphan_id(text: str) -> str | None:
     m = re.search(r"METADATA_NEEDED.*?stored as `(local:[^`]+)`", text, re.DOTALL)
     return m.group(1) if m else None
-
-
-def _normalize_doi_value(value: str | None) -> str | None:
-    if not value:
-        return None
-    doi = value.strip()
-    doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi, flags=re.IGNORECASE)
-    doi = re.sub(r"^doi:\s*", "", doi, flags=re.IGNORECASE)
-    return doi or None
 
 
 def _coerce_year(value: object) -> int | None:
@@ -357,12 +253,8 @@ def _classify_unavailability(
     return "exhausted_chain"
 
 
-# ---------------------------------------------------------------------------
-# Shared throttles for DOI resolution
-# ---------------------------------------------------------------------------
-
-_openalex_throttle = _Throttle(0.125)  # 8 RPS for OpenAlex
-_crossref_throttle = _Throttle(0.1)  # 10 RPS for Crossref
+# _openalex_throttle and _crossref_throttle are imported from server.py (shared
+# title->DOI resolver); see the `from server import (...)` block above.
 
 
 # ---------------------------------------------------------------------------

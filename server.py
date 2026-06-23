@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 
 import httpx
 import numpy as np
@@ -61,6 +61,10 @@ S2_BASE = "https://api.semanticscholar.org/graph/v1"
 S2_RECOMMEND_BASE = "https://api.semanticscholar.org/recommendations/v1"
 UNPAYWALL_BASE = "https://api.unpaywall.org/v2"
 OA_BASE = "https://api.openalex.org"
+# scite Smart Citations: per-DOI "tallies" (supporting/contradicting/mentioning
+# counts). The /tallies/{doi} endpoint is token-less and uncapped — verified
+# 2026-06-23. Used as a citation-reception enrichment, NOT a discovery source.
+SCITE_TALLIES_BASE = "https://api.scite.ai/tallies"
 
 BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -89,7 +93,7 @@ PHILPAPERS_API_KEY = os.environ.get("PHILPAPERS_API_KEY", "")
 PROCESS_PDF_SCRIPT = Path(__file__).parent / "process_pdf.py"
 PROCESS_TEX_SCRIPT = Path(__file__).parent / "process_tex.py"
 
-_SCHEMA_VERSION = 21
+_SCHEMA_VERSION = 22
 
 
 # Phase A.1 (plan v3 §3): page-marker extraction-quality classifier.
@@ -150,6 +154,10 @@ _unpaywall_throttle = _Throttle(1.0)                           # 1 RPS (no docum
 _openalex_throttle = _Throttle(0.125)                          # 8 RPS (conservative under 10 RPS limit, post Feb 2026 pricing change)
 _arxiv_throttle = _Throttle(3.0)                               # 0.33 RPS — arXiv TOS requires >= 3s between requests
 _philpapers_throttle = _Throttle(1.0)                          # 1 RPS — no documented limit, conservative behind Cloudflare
+_scite_throttle = _Throttle(1.6)                               # ~0.6 RPS — scite's token-less limit is 40 req/min
+# Crossref polite pool (10 RPS). Lives here (not acquire_batch.py) so the title->DOI
+# resolver can be shared by the live download_paper tool; acquire_batch imports it back.
+_crossref_throttle = _Throttle(0.1)                            # 10 RPS — Crossref polite pool
 
 
 # --- Embedding Models (lazy singletons) ---
@@ -1153,7 +1161,11 @@ def _init_db() -> sqlite3.Connection:
         # missing columns/tables. Raising here is far better than
         # discovering it via a verify_claim crash 30 minutes into a
         # bench run.
-        row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+        # MAX(version), not LIMIT 1: `version` is the PK, so a version bump leaves
+        # the prior row in place (e.g. {21, 22}). A bare LIMIT 1 returned the
+        # LOWEST row and made every post-bump startup raise spuriously. MAX is the
+        # version actually reached. (Empty table -> NULL -> raises, which is right.)
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         observed = row[0] if row else None
         if observed != _SCHEMA_VERSION:
             raise RuntimeError(
@@ -1260,6 +1272,20 @@ def _run_schema_migrations(conn: sqlite3.Connection) -> None:
         # The v19 migration's separate ALTER + index commands remain
         # idempotent (IF NOT EXISTS guards in the column check + index).
         ("has_gapped_extraction", "INTEGER"),
+        # Schema v22: scite Smart-Citation reception tallies. Raw counts only
+        # (the "contested" judgment is derived at read time so the threshold
+        # can evolve without re-fetching). scite_fetched_at is stamped on every
+        # fetch attempt — including DOIs scite has no record for (counts stay
+        # NULL) — so backfill_scite.py doesn't re-query the same DOI forever.
+        # Populated by acquire/backfill_scite.py and the get_citation_reception
+        # tool; surfaced in search_papers/search_openalex/verify_claim. Added
+        # via this idempotent ALTER loop only (no dedicated migration block —
+        # same pattern as the column-only v7 bump).
+        ("scite_supporting", "INTEGER"),
+        ("scite_contradicting", "INTEGER"),
+        ("scite_mentioning", "INTEGER"),
+        ("scite_total", "INTEGER"),
+        ("scite_fetched_at", "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE papers ADD COLUMN {col} {coltype}")
@@ -1304,8 +1330,11 @@ def _run_schema_migrations(conn: sqlite3.Connection) -> None:
     # Schema versioning for FTS5 rebuild. PRIMARY KEY added in v9 so two
     # concurrent startup racers can't leave duplicate version rows.
     conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")
-    row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
-    current_version = row[0] if row else 0
+    # MAX(version): see the matching note in _init_db. `version` is the PK so old
+    # rows accumulate across bumps; MAX is the version actually reached. NULL
+    # (fresh/empty table) -> 0 so every migration block runs.
+    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    current_version = row[0] if row and row[0] is not None else 0
 
     if current_version < 2:
         conn.execute("DROP TABLE IF EXISTS papers_fts")
@@ -2973,6 +3002,10 @@ def _format_openalex_work(work: dict) -> str:
     if id_parts:
         lines.append(" | ".join(id_parts))
 
+    reception = _scite_reception_line(doi=_normalize_doi_value(doi))
+    if reception:
+        lines.append(reception)
+
     # OA status
     oa = work.get("open_access") or {}
     if oa.get("is_oa"):
@@ -3643,6 +3676,262 @@ def _resolve_to_local_paper_id(conn: sqlite3.Connection, lookup: str) -> str | N
     return row[0] if row else None
 
 
+# ---------------------------------------------------------------------------
+# Title -> DOI resolution cascade (S2 -> OpenAlex -> Crossref).
+#
+# Relocated here from acquire/acquire_batch.py (2026-06-23) so the live
+# download_paper tool can reuse it, not just the batch script. acquire_batch
+# imports these names back from server.py — the import direction is already
+# acquire_batch -> server, so there is no cycle. Behavior is unchanged.
+# ---------------------------------------------------------------------------
+
+def _normalize_doi_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    doi = value.strip()
+    doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi, flags=re.IGNORECASE)
+    doi = re.sub(r"^doi:\s*", "", doi, flags=re.IGNORECASE)
+    return doi or None
+
+
+def _title_similarity(query: str, candidate: str) -> float:
+    """Bidirectional Jaccard-like similarity between two titles. Returns the minimum
+    of (forward containment, reverse containment) so a query matches only when both
+    directions have substantial overlap.
+
+    One-sided containment was unsafe: a short query trivially scored 1.0 against any
+    longer candidate that contained it, including distinct papers in the same series.
+    """
+    def words(t: str) -> set[str]:
+        return set(re.sub(r"[^\w\s]", "", t.lower()).split()) - {
+            "the", "a", "an", "of", "and", "in", "on", "for", "to", "with",
+        }
+    wq, wc = words(query), words(candidate)
+    if not wq or not wc:
+        return 0.0
+    shared = len(wq & wc)
+    fwd = shared / len(wq)
+    rev = shared / len(wc)
+    return min(fwd, rev)
+
+
+async def _s2_title_match(client: httpx.AsyncClient, title: str) -> tuple[dict | None, float]:
+    """GET /paper/search/match — returns (paper_dict, score) or (None, 0)."""
+    await _s2_search_throttle.wait()
+    headers = {"x-api-key": S2_API_KEY} if S2_API_KEY else {}
+    try:
+        resp = await client.get(
+            f"{S2_BASE}/paper/search/match",
+            params={"query": title, "fields": DEFAULT_FIELDS},
+            headers=headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return None, 0.0
+        raise
+    data = resp.json()
+    paper = data.get("data", [{}])[0] if data.get("data") else data
+    score = float(data.get("matchScore") or paper.get("matchScore") or 0)
+    return paper, score
+
+
+async def _resolve_doi_by_title(
+    client: httpx.AsyncClient,
+    title: str,
+    year: int | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve a title to a DOI via three cascading sources.
+
+    Returns (doi, source_name) where source_name is "s2", "openalex", "crossref",
+    or None if nothing is found with sufficient confidence.
+    """
+    normalized_title = (title or "").strip()
+    if len(normalized_title) < 10:
+        return None, None
+    # Defensive: callers pass an S2/OpenAlex year (int|None). Coerce so a stray
+    # "" / "unknown" can't interpolate into a malformed date filter (e.g.
+    # "from-pub-date:-01-01"). Each source is try-wrapped anyway, but this avoids
+    # silently burning a lookup on a guaranteed-400.
+    try:
+        year = int(year) if year is not None else None
+    except (TypeError, ValueError):
+        year = None
+
+    try:
+        paper, score = await _s2_title_match(client, normalized_title)
+        if paper and score >= 0.5:
+            doi = _normalize_doi_value((paper.get("externalIds") or {}).get("DOI"))
+            if doi:
+                return doi, "s2"
+    except Exception:
+        pass
+
+    try:
+        params: dict[str, str | int] = {"search": normalized_title, "per_page": 3}
+        if year is not None:
+            params["filter"] = f"publication_year:{year}"
+        await _openalex_throttle.wait()
+        resp = await client.get("https://api.openalex.org/works", params=params, timeout=30)
+        resp.raise_for_status()
+        work = (resp.json().get("results") or [None])[0]
+        if isinstance(work, dict):
+            candidate_title = (work.get("title") or "").strip()
+            doi = _normalize_doi_value(work.get("doi"))
+            if doi and _title_similarity(normalized_title, candidate_title) >= 0.85:
+                return doi, "openalex"
+    except Exception:
+        pass
+
+    try:
+        params = {"query.title": normalized_title, "rows": 3}
+        if year is not None:
+            params["filter"] = f"from-pub-date:{year}-01-01,until-pub-date:{year}-12-31"
+        await _crossref_throttle.wait()
+        resp = await client.get("https://api.crossref.org/works", params=params, timeout=30)
+        resp.raise_for_status()
+        item = ((resp.json().get("message") or {}).get("items") or [None])[0]
+        if isinstance(item, dict):
+            titles = item.get("title") or []
+            candidate_title = titles[0].strip() if titles else ""
+            doi = _normalize_doi_value(item.get("DOI"))
+            if doi and _title_similarity(normalized_title, candidate_title) >= 0.85:
+                return doi, "crossref"
+    except Exception:
+        pass
+
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# scite Smart-Citation reception (supporting / contradicting / mentioning).
+#
+# Token-less per-DOI tallies cached on the papers table. Fetched out-of-band
+# (acquire/backfill_scite.py) or on demand (get_citation_reception); discovery
+# and verify_claim only READ the cache, so interactive search never blocks on
+# scite's 40 req/min limit. The classifier is noisy and ~93% of statements are
+# "mentioning" — a triage prior, not ground truth.
+# ---------------------------------------------------------------------------
+
+def _scite_is_contested(supporting: int, contradicting: int) -> bool:
+    """Heuristic: flag papers whose findings have drawn real pushback. Tunable
+    without re-fetching because only raw counts are stored."""
+    return contradicting >= 2 and contradicting >= 0.5 * max(supporting, 1)
+
+
+async def _fetch_scite_tally(client: httpx.AsyncClient, doi: str) -> tuple[dict | None, bool]:
+    """Fetch scite citation tallies for a DOI. Returns (tally, ok):
+      tally = {supporting, contradicting, mentioning, total} on HTTP 200,
+              None when scite has no record (404) — a DEFINITIVE, cacheable miss.
+      ok    = False ONLY on a transient failure (429/5xx/transport/timeout/bad
+              JSON); the caller must NOT cache it so a later run retries.
+    Never raises. (Mirrors acquire/backfill_scite.py:fetch_tally semantics so the
+    two paths cache transient vs. definitive misses identically.)"""
+    if not doi:
+        return None, False
+    try:
+        await _scite_throttle.wait()
+        # Keep the DOI's own '/' unencoded (scite routes /tallies/10.x/y), but
+        # percent-encode any other special characters in the suffix.
+        resp = await client.get(f"{SCITE_TALLIES_BASE}/{quote(doi, safe='/')}", timeout=30)
+    except (httpx.HTTPError, httpx.TimeoutException):
+        return None, False
+    if resp.status_code == 404:
+        return None, True           # definitive: scite has no record for this DOI
+    if resp.status_code != 200:
+        return None, False          # transient (429/5xx) — do not cache
+    try:
+        d = resp.json()
+    except ValueError:
+        return None, False
+    if not isinstance(d, dict):
+        return None, False
+    return {
+        "supporting": int(d.get("supporting") or 0),
+        "contradicting": int(d.get("contradicting") or 0),
+        "mentioning": int(d.get("mentioning") or 0),
+        "total": int(d.get("total") or 0),
+    }, True
+
+
+def _update_scite_tally(conn: sqlite3.Connection, paper_id: str, tally: dict | None) -> None:
+    """Persist a scite tally (or a no-record stamp) onto an existing paper row.
+    Always stamps scite_fetched_at so backfill won't re-query the same DOI; when
+    tally is None the counts are cleared (scite had no record)."""
+    now = datetime.now(timezone.utc).isoformat()
+    if tally is None:
+        # Definitive no-record: clear any prior counts so a stale tally is never
+        # shown, and stamp fetched_at so we don't re-query.
+        conn.execute(
+            "UPDATE papers SET scite_supporting = NULL, scite_contradicting = NULL, "
+            "scite_mentioning = NULL, scite_total = NULL, scite_fetched_at = ? WHERE paper_id = ?",
+            (now, paper_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE papers SET scite_supporting = ?, scite_contradicting = ?, "
+            "scite_mentioning = ?, scite_total = ?, scite_fetched_at = ? WHERE paper_id = ?",
+            (tally["supporting"], tally["contradicting"], tally["mentioning"],
+             tally["total"], now, paper_id),
+        )
+    conn.commit()
+
+
+def _cached_scite_tally(conn: sqlite3.Connection, *, doi: str | None = None,
+                        paper_id: str | None = None) -> dict | None:
+    """Read a cached scite tally (no network). Returns
+    {supporting, contradicting, mentioning, total, contested} or None when the
+    row was never fetched, has no record, or has zero statements."""
+    cols = ("scite_supporting", "scite_contradicting", "scite_mentioning", "scite_total")
+    sel = ", ".join(cols)
+    row = None
+    if paper_id:
+        row = conn.execute(
+            f"SELECT {sel} FROM papers WHERE paper_id = ? AND scite_fetched_at IS NOT NULL LIMIT 1",
+            (paper_id,),
+        ).fetchone()
+    if row is None and doi:
+        row = conn.execute(
+            f"SELECT {sel} FROM papers WHERE lower(doi) = lower(?) AND scite_fetched_at IS NOT NULL LIMIT 1",
+            (doi,),
+        ).fetchone()
+    if not row:
+        return None
+    sup, con, men, tot = (row[0] or 0, row[1] or 0, row[2] or 0, row[3] or 0)
+    if sup == 0 and con == 0 and men == 0 and tot == 0:
+        return None
+    return {"supporting": sup, "contradicting": con, "mentioning": men,
+            "total": tot, "contested": _scite_is_contested(sup, con)}
+
+
+def _scite_reception_line(doi: str | None = None, paper_id: str | None = None) -> str | None:
+    """One-line citation-reception summary from cache for result formatting, or
+    None. Uses a bare short-lived READ connection — no WAL pragma and no
+    sqlite-vec load (those cost ~0.7 ms/call via _init_db and are needless for
+    reading four integer columns; this runs once per formatted result). Reading a
+    WAL DB needs no pragma. Never raises so it can't break formatting."""
+    if not doi and not paper_id:
+        return None
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    except Exception:
+        return None
+    try:
+        t = _cached_scite_tally(conn, doi=doi, paper_id=paper_id)
+    except Exception:
+        t = None
+    finally:
+        conn.close()
+    if not t:
+        return None
+    line = (f"Reception (scite): {t['supporting']} supporting / "
+            f"{t['contradicting']} contradicting / {t['mentioning']} mentioning")
+    if t["contested"]:
+        line += " — CONTESTED"
+    return line
+
+
 def _format_paper(p: dict) -> str:
     lines = []
     title = p.get("title", "Unknown")
@@ -3689,6 +3978,10 @@ def _format_paper(p: dict) -> str:
         id_parts.append(f"S2: {s2_id}")
     if id_parts:
         lines.append(" | ".join(id_parts))
+
+    reception = _scite_reception_line(doi=doi, paper_id=s2_id)
+    if reception:
+        lines.append(reception)
 
     oa = p.get("isOpenAccess", False)
     oa_pdf = p.get("openAccessPdf") or {}
@@ -4178,6 +4471,29 @@ async def download_paper(paper_id: str, output_dir: str = "") -> str:
                     return f"Downloaded ({len(pdf_resp.content)} bytes): {filepath}\nTitle: {title}{process_status}"
             except Exception as e:
                 print(f"S2 PDF download error for {pdf_url}: {e}", file=sys.stderr)
+
+        # No DOI from S2? Resolve one from the title before giving up. This is
+        # the same S2/OpenAlex/Crossref cascade acquire_batch.py uses, now reused
+        # by the live tool so a DOI-less record can still reach Unpaywall.
+        if not doi and title and title != "unknown":
+            try:
+                resolved_doi, resolved_src = await _resolve_doi_by_title(client, title, year)
+            except Exception as e:
+                resolved_doi, resolved_src = None, None
+                print(f"DOI resolution error for {title!r}: {e}", file=sys.stderr)
+            if resolved_doi:
+                doi = resolved_doi
+                rconn = _init_db()
+                try:
+                    rconn.execute(
+                        "UPDATE papers SET doi = ?, last_updated = ? "
+                        "WHERE paper_id = ? AND (doi IS NULL OR doi = '')",
+                        (doi, datetime.now(timezone.utc).isoformat(), s2_id),
+                    )
+                    rconn.commit()
+                finally:
+                    rconn.close()
+                print(f"Resolved DOI via {resolved_src}: {doi}", file=sys.stderr)
 
         # Try Unpaywall if we have a DOI
         if doi and UNPAYWALL_EMAIL:
@@ -7606,8 +7922,74 @@ async def verify_claim(
             "evidence_span": winning_text[:1500],
             "abstain": abstain,
             "min_confidence": min_confidence,
+            "scite_reception": _cached_scite_tally(conn, doi=doi or None, paper_id=pid),
             "tier_0": tier_0,
         }, indent=2)
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def get_citation_reception(paper_id: str) -> str:
+    """Citation RECEPTION for a paper via scite Smart Citations: how many later
+    papers SUPPORT, CONTRADICT, or merely MENTION its findings — the direction a
+    raw citation count cannot show.
+
+    Accepts a DOI, S2 ID, ArXiv ID, PMID, or URL. scite is DOI-keyed, so a DOI is
+    resolved first (from the local library, else Semantic Scholar). The tally is
+    cached on the local row when one exists.
+
+    CAVEAT: scite auto-classifies citation statements; ~93% land in "mentioning"
+    and the classifier is noisy. Treat the tally as a triage prior, not ground
+    truth — pair it with verify_claim for high-stakes citations.
+    """
+    raw = (paper_id or "").strip()
+    pid = _normalize_id(raw)
+    doi = raw if re.match(r"^10\.\d{4,}/", raw) else ""
+
+    conn = _init_db()
+    try:
+        local_pid = _resolve_to_local_paper_id(conn, pid)
+        if not doi and local_pid:
+            row = conn.execute("SELECT doi FROM papers WHERE paper_id = ?", (local_pid,)).fetchone()
+            if row and row[0]:
+                doi = row[0]
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            # Last resort for a non-local paper: ask S2 for its DOI.
+            if not doi:
+                try:
+                    resp = await _throttled_get(
+                        client, f"{S2_BASE}/paper/{pid}", params={"fields": "externalIds"}
+                    )
+                    doi = (resp.json().get("externalIds") or {}).get("DOI") or ""
+                except Exception:
+                    doi = ""
+            if not doi:
+                return json.dumps(
+                    {"paper_id": paper_id, "found": False,
+                     "note": "No DOI available; scite is DOI-keyed."}, indent=2)
+            tally, ok = await _fetch_scite_tally(client, doi)
+        if not ok:
+            # Transient scite failure — do NOT cache it, or backfill would treat
+            # the DOI as permanently done. Surface it so the caller can retry.
+            return json.dumps(
+                {"paper_id": paper_id, "doi": doi, "found": False,
+                 "note": "scite request failed transiently; not cached — retry later."}, indent=2)
+        if local_pid:
+            _update_scite_tally(conn, local_pid, tally)
+        if tally is None:
+            return json.dumps(
+                {"paper_id": paper_id, "doi": doi, "found": False,
+                 "note": "scite has no record for this DOI."}, indent=2)
+        return json.dumps(
+            {"paper_id": paper_id, "doi": doi, "found": True,
+             "supporting": tally["supporting"],
+             "contradicting": tally["contradicting"],
+             "mentioning": tally["mentioning"],
+             "total": tally["total"],
+             "contested": _scite_is_contested(tally["supporting"], tally["contradicting"]),
+             "caveat": "scite auto-classification is noisy; ~93% of statements are 'mentioning'. Triage prior, not ground truth."},
+            indent=2)
     finally:
         conn.close()
 
