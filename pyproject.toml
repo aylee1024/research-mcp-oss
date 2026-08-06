@@ -26,29 +26,33 @@ classifiers = [
     "Topic :: Text Processing :: Indexing",
     "Typing :: Typed",
 ]
+# Every requirement carries an upper bound. An unbounded requirement adopts
+# the next major release the first time a resolver runs: mcp 2.0.0 removed
+# mcp.server.fastmcp, and installs that had pinned nothing simply stopped
+# booting. Widen a bound only after exercising the new major.
 dependencies = [
-    "mcp[cli]",
-    "httpx",
-    "sqlite-vec",
-    "sentence-transformers",
-    "numpy",
-    "einops",
-    "torch",
+    "mcp[cli]>=2.0.0,<3",
+    "httpx>=0.28,<1",
+    "sqlite-vec>=0.1.9,<0.2",
+    "sentence-transformers>=5.7,<6",
+    "numpy>=2.5,<3",
+    "einops>=0.8,<0.9",
+    "torch>=2.13,<3",
 ]
 
 [project.optional-dependencies]
 # Apple Silicon Metal acceleration for embeddings + reranking.
-mlx = ["mlx", "mlx-embeddings"]
+mlx = ["mlx>=0.32,<1", "mlx-embeddings>=0.1,<0.2"]
 # PDF processing pipeline. Docling is large; pull it in only if you need
 # `process_pdf` and `acquire_batch`.
-pdf = ["docling", "pymupdf", "pdfplumber"]
+pdf = ["docling>=2.118,<3", "pymupdf>=1.28,<2", "pdfplumber>=0.11,<0.12"]
 # Everything (recommended for first install).
 all = [
-    "mlx ; platform_machine == 'arm64' and sys_platform == 'darwin'",
-    "mlx-embeddings ; platform_machine == 'arm64' and sys_platform == 'darwin'",
-    "docling",
-    "pymupdf",
-    "pdfplumber",
+    "mlx>=0.32,<1 ; platform_machine == 'arm64' and sys_platform == 'darwin'",
+    "mlx-embeddings>=0.1,<0.2 ; platform_machine == 'arm64' and sys_platform == 'darwin'",
+    "docling>=2.118,<3",
+    "pymupdf>=1.28,<2",
+    "pdfplumber>=0.11,<0.12",
 ]
 
 [project.urls]

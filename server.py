@@ -1,17 +1,22 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "mcp[cli]",
-#     "httpx",
-#     "sqlite-vec",
-#     "sentence-transformers",
-#     "numpy",
-#     "einops",
-#     "torch",
-#     "mlx ; platform_machine == 'arm64' and sys_platform == 'darwin'",
-#     "mlx-embeddings ; platform_machine == 'arm64' and sys_platform == 'darwin'",
+#     "mcp[cli]>=2.0.0,<3",
+#     "httpx>=0.28,<1",
+#     "sqlite-vec>=0.1.9,<0.2",
+#     "sentence-transformers>=5.7,<6",
+#     "numpy>=2.5,<3",
+#     "einops>=0.8,<0.9",
+#     "torch>=2.13,<3",
+#     "mlx>=0.32,<1 ; platform_machine == 'arm64' and sys_platform == 'darwin'",
+#     "mlx-embeddings>=0.1,<0.2 ; platform_machine == 'arm64' and sys_platform == 'darwin'",
 # ]
 # ///
+#
+# Every dependency carries an upper bound. `uv run server.py` resolves this
+# block fresh whenever the cache misses, so an unbounded requirement silently
+# adopts the next major release: mcp 2.0.0 dropped mcp.server.fastmcp and the
+# server stopped booting. Widen a bound only after exercising the new major.
 
 import asyncio
 import gzip
@@ -35,7 +40,7 @@ from urllib.parse import urljoin, quote
 import httpx
 import numpy as np
 import sqlite_vec
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 # Make the sibling `research_mcp` package importable when this script is
 # invoked directly (e.g. `uv run server.py`). The script's own directory is
@@ -128,7 +133,7 @@ def _classify_page_markers(processed_text: str) -> int | None:
             return 1
     return 0
 
-mcp = FastMCP("semantic-scholar")
+mcp = MCPServer("semantic-scholar")
 
 class _Throttle:
     """Per-API rate limiter."""
@@ -8724,7 +8729,7 @@ async def check_library_batch(sources_json: str) -> str:
 
 
 def main() -> None:
-    """Console-script entry point. Runs the FastMCP server over stdio.
+    """Console-script entry point. Runs the MCP server over stdio.
 
     Performs eager schema initialization on startup so a fresh install
     has a usable database and migration head before the first MCP tool
