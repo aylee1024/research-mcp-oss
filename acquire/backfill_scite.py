@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "httpx",
+#     "httpx>=0.28,<1",
 # ]
 # ///
 """Backfill scite citation-reception tallies into the local paper library.

@@ -1,13 +1,13 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "pytest",
-#     "pytest-asyncio",
-#     "respx",
-#     "httpx",
-#     "mcp[cli]",
-#     "sqlite-vec",
-#     "numpy",
+#     "pytest>=9.1,<10",
+#     "pytest-asyncio>=1.4,<2",
+#     "respx>=0.23,<0.24",
+#     "httpx>=0.28,<1",
+#     "mcp[cli]>=2.0.0,<3",
+#     "sqlite-vec>=0.1.9,<0.2",
+#     "numpy>=2.5,<3",
 # ]
 # ///
 """Tests for the scite citation-reception + shared title->DOI resolver work

@@ -1,13 +1,13 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "mcp[cli]",
-#     "httpx",
-#     "sqlite-vec",
-#     "sentence-transformers",
-#     "numpy",
-#     "einops",
-#     "torch",
+#     "mcp[cli]>=2.0.0,<3",
+#     "httpx>=0.28,<1",
+#     "sqlite-vec>=0.1.9,<0.2",
+#     "sentence-transformers>=5.7,<6",
+#     "numpy>=2.5,<3",
+#     "einops>=0.8,<0.9",
+#     "torch>=2.13,<3",
 # ]
 # ///
 """Deduplicate papers.db: find and merge duplicate entries for the same work.

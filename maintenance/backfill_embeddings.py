@@ -1,14 +1,14 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "mcp[cli]",
-#     "httpx",
-#     "sentence-transformers[onnx]",
-#     "onnxruntime",
-#     "sqlite-vec",
-#     "numpy",
-#     "einops",
-#     "torch",
+#     "mcp[cli]>=2.0.0,<3",
+#     "httpx>=0.28,<1",
+#     "sentence-transformers[onnx]>=5.7,<6",
+#     "onnxruntime>=1.28,<2",
+#     "sqlite-vec>=0.1.9,<0.2",
+#     "numpy>=2.5,<3",
+#     "einops>=0.8,<0.9",
+#     "torch>=2.13,<3",
 # ]
 # ///
 """Standalone embedding backfill for papers.db.

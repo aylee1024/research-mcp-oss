@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "sqlite-vec",
+#     "sqlite-vec>=0.1.9,<0.2",
 # ]
 # ///
 """One-off cleanup: delete orphan rows in vec_papers and vec_chunks.

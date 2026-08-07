@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "httpx",
+#     "httpx>=0.28,<1",
 # ]
 # ///
 """One-time citation-graph backfill for ~17k papers in papers.db.

@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "docling",
+#     "docling>=2.118,<3",
 # ]
 # ///
 

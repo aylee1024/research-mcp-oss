@@ -2,15 +2,15 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "mcp[cli]",
-#     "httpx",
-#     "sqlite-vec",
-#     "sentence-transformers",
-#     "numpy",
-#     "einops",
-#     "torch",
-#     "mlx",
-#     "mlx-embeddings",
+#     "mcp[cli]>=2.0.0,<3",
+#     "httpx>=0.28,<1",
+#     "sqlite-vec>=0.1.9,<0.2",
+#     "sentence-transformers>=5.7,<6",
+#     "numpy>=2.5,<3",
+#     "einops>=0.8,<0.9",
+#     "torch>=2.13,<3",
+#     "mlx>=0.32,<1",
+#     "mlx-embeddings>=0.1,<0.2",
 # ]
 # ///
 """Plan v3 Phase 4R Phase 2: backfill Qwen3-Embedding-4B-MLX vectors.
