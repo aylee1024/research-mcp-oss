@@ -585,6 +585,38 @@ def test_a_tie_for_best_coverage_is_reported_not_resolved_silently(library):
     assert "not a judgement" in result
 
 
+def test_the_tie_count_appears_on_a_line_a_parser_can_read(library):
+    """The harness reads this output line by line; prose in the header is invisible to it."""
+    connection = sqlite3.connect(library)
+    connection.execute(
+        "INSERT INTO paper_chunks (paper_id, chunk_index, chunk_text) VALUES (?,?,?)",
+        ("paper-a", 2, f"Another passage carrying {QUOTATION} word for word."),
+    )
+    connection.commit()
+    connection.close()
+
+    lines = _run(server.find_quotation(QUOTATION, fuzzy=True)).splitlines()
+    tie_lines = [line for line in lines if line.startswith("coverage_tied_with:")]
+    assert tie_lines, "a line-parsing caller must be able to see the tie"
+    assert any(int(line.split(":")[1]) >= 1 for line in tie_lines)
+
+
+def test_the_tie_count_is_zero_when_a_match_stands_alone(library):
+    lines = _run(server.find_quotation(QUOTATION, paper_id="paper-a", fuzzy=True)).splitlines()
+    assert "coverage_tied_with: 0" in lines
+
+
+def test_the_window_width_does_not_depend_on_the_caller_deduplicating():
+    """The last line in the function that read the caller's list rather than the terms."""
+    quotation = "wall thickness of the wall was 0.05 cm and the wall thickness varied"
+    raw = [t.casefold() for t in server._fts5_tokenize(quotation)]
+    raw = [t for t in raw if t not in server._FTS_STOPWORDS]
+    passage = f"prelude {quotation} coda"
+    assert server._quotation_coverage(raw, passage) == server._quotation_coverage(
+        server._quotation_terms(quotation), passage
+    )
+
+
 def test_a_single_best_match_is_not_flagged_as_tied(library):
     """Scoped to one paper there is only one passage, so nothing is being tiebroken."""
     result = _run(server.find_quotation(QUOTATION, paper_id="paper-a", fuzzy=True))

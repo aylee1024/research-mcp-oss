@@ -942,7 +942,7 @@ def _quotation_coverage(content: list[str], passage: str) -> float:
     if not positions:
         return 0.0
 
-    width = max(int(len(content) * _FUZZY_WINDOW_SLACK), _FUZZY_MIN_WINDOW)
+    width = max(int(len(wanted) * _FUZZY_WINDOW_SLACK), _FUZZY_MIN_WINDOW)
     counts: dict[str, int] = {}
     best = distinct = left = 0
     for right, (position, token) in enumerate(positions):
@@ -983,6 +983,21 @@ def _filter_by_token_coverage(
     scored.sort(key=lambda pair: -pair[0])
     kept = scored[:limit]
     return [row for _, row in kept], {row[0]: coverage for coverage, row in kept}
+
+
+def _coverage_ties(coverage_by_row: dict) -> dict:
+    """How many other results share each result's coverage score.
+
+    The header sentence about ties is for a person; this is for the programs.
+    Both `benchmark_pincite.py` and the citing agents read this tool's output
+    line by line for a page field, so anything said only in prose above the
+    matches is invisible to them and they take the first page in silence.
+    """
+    tallies: dict[float, int] = {}
+    for value in coverage_by_row.values():
+        key = round(value, 6)
+        tallies[key] = tallies.get(key, 0) + 1
+    return {row: tallies[round(value, 6)] - 1 for row, value in coverage_by_row.items()}
 
 
 def _coverage_is_tied(coverage_by_row: dict) -> int:
@@ -7422,6 +7437,7 @@ async def find_quotation(
     # hit and a passage that merely shares vocabulary, so the caller sees it,
     # alongside the share of the quotation each passage actually contains.
     strength = "" if not fuzzy else f" [matched on: {quote_diag.tier}]"
+    coverage_ties = _coverage_ties(coverage_by_chunk) if fuzzy else {}
     if fuzzy:
         shared = _coverage_is_tied(coverage_by_chunk)
         if shared > 1:
@@ -7450,6 +7466,7 @@ async def find_quotation(
                 f"quotation_coverage: {coverage_by_chunk.get(chunk_id, 0.0):.0%} "
                 f"of the quotation's words appear in this passage"
             )
+            parts.append(f"coverage_tied_with: {coverage_ties.get(chunk_id, 0)}")
         parts.append(f"**{title}** ({year})")
         if is_retracted:
             parts.append("⚠️ **RETRACTED** — do not cite without verification")
