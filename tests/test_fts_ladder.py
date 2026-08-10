@@ -681,6 +681,23 @@ def test_like_cannot_see_past_a_nul_but_instr_can(tmp_path):
     assert instr == 1
 
 
+def test_lower_does_not_reintroduce_the_truncation(tmp_path):
+    """`length(lower(x))` reports the pre-NUL count while the value is intact.
+
+    Anyone auditing the guard by measuring a length will conclude it is
+    defeated; this records that `length` is the function that stops at the NUL,
+    not `lower`.
+    """
+    connection = sqlite3.connect(":memory:")
+    text = f"ab{NUL}CDEFGH"
+    reported, found = connection.execute(
+        "SELECT length(lower(?)), instr(lower(?), lower(?))", (text, text, "cdef")
+    ).fetchone()
+    connection.close()
+    assert reported == 2, "length() no longer truncates; the comment on the fix is stale"
+    assert found == 4, "lower() must fold the whole value, not stop at the NUL"
+
+
 def test_in_paper_search_matches_the_callers_text_literally():
     """`%` and `_` are wildcards to LIKE; this argument is documented as plain text."""
     source = (PROJECT_ROOT / "server.py").read_text(encoding="utf-8")

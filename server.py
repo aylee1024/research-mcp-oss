@@ -8629,6 +8629,11 @@ async def search_within_paper(
             # words plainly on the page. LIKE also reads `%` and `_` in the
             # caller's text as wildcards, while this argument is documented as
             # a plain substring; `instr` matches it literally.
+            # `lower()` is safe here even though `length(lower(text))` reports
+            # the pre-NUL count: the value is folded whole and `instr` finds
+            # matches past the NUL. It is `length()` that stops there, always
+            # and everywhere, so verifying this guard by measuring a length
+            # will suggest it is defeated when it is not.
             rows = conn.execute(
                 "SELECT passage_id, page_num, section_header, passage_text "
                 "FROM paper_passages "
