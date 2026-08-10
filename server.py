@@ -9440,7 +9440,13 @@ def _check_lexical_retrieval(database_path: Path) -> tuple[bool, str]:
         paper_id, title, abstract = sources[0]
         words = abstract.split()
         span = " ".join(words[:12])
-        tail = " ".join(words[12:24])
+        # Four content words drawn from one short stretch of the abstract, with
+        # gaps between them. No phrase spans them, so the phrase rung misses,
+        # while they stay inside a proximity window — which is the only way to
+        # reach the NEAR rungs. Adjacent slices would match as one phrase and
+        # those rungs would never be exercised.
+        opening = [w for w in words[:40] if w.casefold().strip(".,;:()") not in _FTS_STOPWORDS]
+        scattered = " ".join(opening[0:12:3][:4])
 
         # (probe, rungs that would count as a pass, whether the source paper
         # itself must come back).
@@ -9451,8 +9457,8 @@ def _check_lexical_retrieval(database_path: Path) -> tuple[bool, str]:
         # shape that used to raise and be reported as "no results".
         probes = (
             (f'{span}"', {"exact_phrase"}, True),
-            (f"{span} — {tail}", {"exact_phrase", "near_10", "near_30"}, False),
-            (f"How does {title} bear on {tail}?", {"any_term"}, False),
+            (scattered, {"near_10", "near_30"}, False),
+            (f"How does {title} bear on {span}?", {"any_term"}, False),
         )
 
         failures = []

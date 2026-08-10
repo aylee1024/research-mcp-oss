@@ -375,6 +375,28 @@ def test_lexical_retrieval_check_skips_an_empty_library(tmp_path):
     assert "no full-text paper" in detail
 
 
+def test_lexical_retrieval_check_catches_deleted_proximity_rungs(tmp_path, monkeypatch):
+    """The middle probe exists to reach NEAR; it must fail when NEAR is gone."""
+    database = tmp_path / "papers.db"
+    _papers_database(database)
+    original = server._fts5_ladder
+    monkeypatch.setattr(
+        server,
+        "_fts5_ladder",
+        lambda q: [r for r in original(q) if not r[0].startswith("near_")],
+    )
+    passed, detail = server._check_lexical_retrieval(database)
+    assert passed is False
+    assert "near_10/near_30" in detail
+
+
+def test_the_chunk_fallback_alarm_fires_only_on_a_broken_chunk_index():
+    """The threshold sits above every share a healthy wide search produces."""
+    healthy = (0.24, 0.44, 0.55, 0.60, 0.63, 0.65, 0.84)
+    assert not any(share > server._CHUNK_FALLBACK_ALARM for share in healthy)
+    assert 1.0 > server._CHUNK_FALLBACK_ALARM
+
+
 def test_lexical_retrieval_check_reports_a_missing_database(tmp_path):
     passed, detail = server._check_lexical_retrieval(tmp_path / "absent.db")
     assert passed is False
