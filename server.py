@@ -791,6 +791,13 @@ _FTS_MAX_TERMS = 60
 # caller can apply a stricter one.
 _FUZZY_MIN_COVERAGE = 0.6
 
+# How much longer than the quotation the search window may be, and its floor for
+# short quotations. Extraction adds tokens — a split ligature turns one word into
+# three — so the window has to be looser than the quotation it is looking for.
+# The score is insensitive across 2x to 4x on this corpus.
+_FUZZY_WINDOW_SLACK = 3.0
+_FUZZY_MIN_WINDOW = 40
+
 # The share of reranked candidates falling back to their abstract that stops
 # being routine and starts indicating a broken chunk index. Measured across a
 # benchmark run on this corpus, a healthy wide search ranges from 0.24 to 0.84
@@ -884,6 +891,51 @@ def _fts5_ladder(query: str) -> list[tuple[str, str]]:
     return [r for r in rungs if not (r[1] in seen or seen.add(r[1]))]
 
 
+def _quotation_coverage(content: list[str], passage: str) -> float:
+    """The share of a quotation's words found together in one stretch of a passage.
+
+    Asking only whether each word appears *somewhere* in the passage is too weak
+    to judge a quotation. A passage runs to several hundred words, so an
+    unrelated one written in the same field's vocabulary can contain most of
+    them scattered across its length. Measured on this corpus, that lets a
+    fabricated sentence in the corpus's own idiom score 0.67 and come back
+    carrying a page number.
+
+    A real quotation's words occur *together*, so the score is the largest
+    number of distinct quotation words falling inside a single window of the
+    passage, sized to the quotation with room for the drift that extraction
+    introduces. That separates the two cleanly: genuine quotations score 0.80 at
+    the fifth percentile against their source, while fabricated ones top out at
+    0.40 anywhere in the corpus.
+    """
+    if not content:
+        return 0.0
+    wanted = set(content)
+    positions = [
+        (index, token)
+        for index, token in enumerate(t.casefold() for t in _fts5_tokenize(passage))
+        if token in wanted
+    ]
+    if not positions:
+        return 0.0
+
+    width = max(int(len(content) * _FUZZY_WINDOW_SLACK), _FUZZY_MIN_WINDOW)
+    counts: dict[str, int] = {}
+    best = distinct = left = 0
+    for right, (position, token) in enumerate(positions):
+        counts[token] = counts.get(token, 0) + 1
+        if counts[token] == 1:
+            distinct += 1
+        while position - positions[left][0] >= width:
+            leaving = positions[left][1]
+            counts[leaving] -= 1
+            if counts[leaving] == 0:
+                distinct -= 1
+            left += 1
+        best = max(best, distinct)
+    return best / len(content)
+
+
 def _filter_by_token_coverage(
     text: str, rows: list, limit: int
 ) -> tuple[list, dict]:
@@ -893,10 +945,8 @@ def _filter_by_token_coverage(
     shares a single uncommon word. That is the right behaviour for topical
     search and the wrong behaviour for a quotation, because every result here
     carries a page number and a page number from this tool becomes a pin cite.
-    Coverage is measured directly against the passage text — exact, not a
-    ranking heuristic — and results are ordered by it, since a passage holding
-    95% of a quotation is a better answer than one holding 40% of it with a
-    rarer word.
+    Results are ordered by coverage, since a passage holding 95% of a quotation
+    is a better answer than one holding 40% of it with a rarer word.
     """
     wanted = [t.casefold() for t in _fts5_tokenize(text)]
     content = [t for t in wanted if t not in _FTS_STOPWORDS] or wanted
@@ -905,8 +955,7 @@ def _filter_by_token_coverage(
 
     scored = []
     for row in rows:
-        present = {t.casefold() for t in _fts5_tokenize(row[1])}
-        coverage = sum(1 for t in content if t in present) / len(content)
+        coverage = _quotation_coverage(content, row[1])
         if coverage >= _FUZZY_MIN_COVERAGE:
             scored.append((coverage, row))
     scored.sort(key=lambda pair: -pair[0])

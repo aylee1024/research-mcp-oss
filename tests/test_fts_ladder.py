@@ -510,6 +510,34 @@ def test_fuzzy_coverage_is_measured_against_the_passage_not_the_ranking(library)
     assert coverage[2] == 1.0
 
 
+def test_coverage_requires_the_words_together_not_merely_present():
+    """A long passage in the same vocabulary contains most of any quotation's words."""
+    content = [t.casefold() for t in server._fts5_tokenize(QUOTATION)]
+    content = [t for t in content if t not in server._FTS_STOPWORDS]
+
+    together = f"filler text. {QUOTATION}. more filler."
+    scattered = " ".join(
+        word + " " + " ".join(f"padding{i}" for i in range(30))
+        for i, word in enumerate(QUOTATION.split())
+    )
+    assert server._quotation_coverage(content, together) == 1.0
+    assert server._quotation_coverage(content, scattered) < server._FUZZY_MIN_COVERAGE
+
+
+def test_coverage_survives_the_extra_tokens_extraction_introduces():
+    """A split ligature turns one word into three; the window has to absorb that."""
+    content = [t.casefold() for t in server._fts5_tokenize(QUOTATION)]
+    content = [t for t in content if t not in server._FTS_STOPWORDS]
+    corrupted = QUOTATION.replace("necessary", "suf fi ciently necessary")
+    assert server._quotation_coverage(content, corrupted) >= server._FUZZY_MIN_COVERAGE
+
+
+def test_coverage_of_a_passage_sharing_nothing_is_zero():
+    content = [t.casefold() for t in server._fts5_tokenize(QUOTATION)]
+    assert server._quotation_coverage(content, "photosynthesis in deep ocean vents") == 0.0
+    assert server._quotation_coverage([], "anything at all") == 0.0
+
+
 def test_fuzzy_mode_reports_which_rung_matched(library):
     """Verbatim and merely-overlapping hits must not look the same to the caller."""
     verbatim = _run(server.find_quotation(QUOTATION, fuzzy=True))
