@@ -792,9 +792,13 @@ _FTS_MAX_TERMS = 60
 _FUZZY_MIN_COVERAGE = 0.6
 
 # The share of reranked candidates falling back to their abstract that stops
-# being routine and starts indicating a broken chunk index. Measured on this
-# corpus, a healthy wide search sits around a third.
-_CHUNK_FALLBACK_ALARM = 0.5
+# being routine and starts indicating a broken chunk index. Measured across a
+# benchmark run on this corpus, a healthy wide search ranges from 0.24 to 0.84
+# with a median of 0.44 — the figure tracks how specific the query is, not
+# whether anything is wrong. A threshold anywhere inside that range would put a
+# warning on ordinary searches, which is the blindness this reporting exists to
+# remove. A chunk index that has genuinely stopped answering drives it to 1.0.
+_CHUNK_FALLBACK_ALARM = 0.9
 
 
 class FtsDiagnostics(NamedTuple):
