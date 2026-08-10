@@ -793,9 +793,13 @@ _FUZZY_MIN_COVERAGE = 0.6
 
 # How much longer than the quotation the search window may be, and its floor for
 # short quotations. Extraction adds tokens — a split ligature turns one word into
-# three — so the window has to be looser than the quotation it is looking for.
-# The score is insensitive across 2x to 4x on this corpus.
-_FUZZY_WINDOW_SLACK = 3.0
+# three — so the window has to be looser than the text it is looking for, and the
+# floor is what carries that for short quotations. Measured against passages whose
+# ligatures were split six times, recall runs 60% at 1.5x with no floor, 73% at
+# 2.0x, and 84% once the floor applies, at which point 2.0x and 3.0x are
+# indistinguishable and the tighter one wins 0.2 points of precision. Tightening
+# below this trades recall on damaged text for almost nothing.
+_FUZZY_WINDOW_SLACK = 2.0
 _FUZZY_MIN_WINDOW = 40
 
 # The share of reranked candidates falling back to their abstract that stops

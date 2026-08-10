@@ -540,6 +540,25 @@ def test_a_quotation_fully_covers_its_own_text_even_when_it_repeats_words():
     assert server._quotation_coverage(terms, repetitive) == 1.0
 
 
+def test_the_window_absorbs_the_tokens_extraction_inserts():
+    """What the window size is chosen for.
+
+    A split ligature does not merely damage the word it lands in — it inserts
+    tokens, pushing the quotation's surviving words further apart in the
+    passage. The window has to stay wide enough to hold them, so this pins the
+    behaviour rather than the constant: tightening the window is possible only
+    by accepting the recall it costs on damaged text.
+    """
+    quotation = "the Committee concluded these measures were neither necessary nor proportionate"
+    terms = server._quotation_terms(quotation)
+    padded = " ".join(word + " fi" for word in quotation.split())
+    assert server._quotation_coverage(terms, padded) == 1.0
+
+    # Far enough apart and they are no longer one quotation.
+    scattered = " ".join(word + " " + " ".join(["fi"] * 25) for word in quotation.split())
+    assert server._quotation_coverage(terms, scattered) < server._FUZZY_MIN_COVERAGE
+
+
 def test_coverage_does_not_depend_on_the_caller_deduplicating():
     """The measure has to be right for any caller, not only the one that dedupes."""
     quotation = "wall thickness of the wall was 0.05 cm and the wall thickness varied"
