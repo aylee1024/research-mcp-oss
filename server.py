@@ -21,6 +21,7 @@
 import asyncio
 import gzip
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -31,6 +32,7 @@ import threading
 import sys
 import tarfile
 import time
+import tomllib
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -99,6 +101,55 @@ PROCESS_PDF_SCRIPT = Path(__file__).parent / "process_pdf.py"
 PROCESS_TEX_SCRIPT = Path(__file__).parent / "process_tex.py"
 
 _SCHEMA_VERSION = 22
+
+# The tool surface this server is expected to expose, by name. A count alone
+# is not a regression gate: thirty-four tools with thirty-four wrong names
+# satisfy it. Callers bind to names, so the names are what must hold.
+EXPECTED_TOOL_NAMES = (
+    "backfill_embeddings",
+    "browse_philpapers",
+    "check_jstor",
+    "check_library_batch",
+    "download_arxiv_tex",
+    "download_paper",
+    "find_quotation",
+    "fix_orphan_paper",
+    "get_citation_reception",
+    "get_citations",
+    "get_full_text",
+    "get_local_references",
+    "get_paper",
+    "get_papers_batch",
+    "get_references",
+    "get_venue_quality",
+    "library_stats",
+    "list_philpapers_categories",
+    "locate_claim_in_paper",
+    "match_paper_by_title",
+    "process_pdf",
+    "process_tex",
+    "prune_unverified",
+    "recommend_papers",
+    "search_local",
+    "search_openalex",
+    "search_papers",
+    "search_passages",
+    "search_philpapers",
+    "search_within_paper",
+    "set_abstract",
+    "store_web_capture",
+    "verify_claim",
+    "verify_paper",
+)
+EXPECTED_TOOL_COUNT = len(EXPECTED_TOOL_NAMES)
+
+_SELFTEST_REFERENCED_PATHS = (
+    "acquire/acquire_batch.py",
+    "acquire/retraction_refresh.py",
+    "maintenance/repair_db_v2.py",
+    "process_pdf.py",
+    "process_tex.py",
+)
 
 
 # Phase A.1 (plan v3 §3): page-marker extraction-quality classifier.
@@ -8728,6 +8779,295 @@ async def check_library_batch(sources_json: str) -> str:
         conn.close()
 
 
+def _read_pep_723_dependencies(script_path: Path) -> list[str]:
+    """Read the dependency list from a script's PEP 723 metadata block."""
+    lines = script_path.read_text(encoding="utf-8").splitlines()
+    try:
+        block_start = lines.index("# /// script") + 1
+        block_end = lines.index("# ///", block_start)
+    except ValueError as exc:
+        raise ValueError(f"PEP 723 script metadata is missing from {script_path}") from exc
+
+    metadata_lines = []
+    for line in lines[block_start:block_end]:
+        if not line.startswith("#"):
+            raise ValueError(f"Invalid PEP 723 metadata line in {script_path}: {line!r}")
+        metadata_lines.append(line[2:] if line.startswith("# ") else line[1:])
+
+    metadata = tomllib.loads("\n".join(metadata_lines))
+    dependencies = metadata.get("dependencies")
+    if not isinstance(dependencies, list) or not dependencies or not all(
+        isinstance(requirement, str) and requirement.strip()
+        for requirement in dependencies
+    ):
+        raise ValueError(f"PEP 723 dependencies must be a non-empty string list in {script_path}")
+    return dependencies
+
+
+def _read_project_dependencies(pyproject_path: Path) -> tuple[list[str], list[str]]:
+    """Read core and optional dependency lists from a project table."""
+    with pyproject_path.open("rb") as handle:
+        project = tomllib.load(handle).get("project")
+    if not isinstance(project, dict):
+        raise ValueError(f"project table is missing from {pyproject_path}")
+
+    dependencies = project.get("dependencies")
+    if not isinstance(dependencies, list) or not dependencies or not all(
+        isinstance(requirement, str) and requirement.strip()
+        for requirement in dependencies
+    ):
+        raise ValueError(f"project.dependencies must be a non-empty string list in {pyproject_path}")
+
+    optional_groups = project.get("optional-dependencies", {})
+    if not isinstance(optional_groups, dict):
+        raise ValueError(f"project.optional-dependencies must be a table in {pyproject_path}")
+    optional_dependencies = []
+    for group_name, requirements in optional_groups.items():
+        if not isinstance(requirements, list) or not all(
+            isinstance(requirement, str) and requirement.strip()
+            for requirement in requirements
+        ):
+            raise ValueError(
+                f"project.optional-dependencies.{group_name} must be a string list in {pyproject_path}"
+            )
+        optional_dependencies.extend(requirements)
+    return dependencies, optional_dependencies
+
+
+def _parse_requirement_specifiers(requirement: str) -> tuple[str, frozenset[str], bool]:
+    """Return a canonical distribution name, version clauses, and upper-bound status."""
+    declaration, marker_separator, marker = requirement.partition(";")
+    if marker_separator and not marker.strip():
+        raise ValueError(f"Requirement has an empty environment marker: {requirement!r}")
+    match = re.fullmatch(
+        r"([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
+        r"(?:\s*\[[^\]]+\])?\s*(.*)",
+        declaration.strip(),
+    )
+    if match is None:
+        raise ValueError(f"Cannot parse requirement: {requirement!r}")
+
+    name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
+    specifier_text = match.group(2).strip()
+    if specifier_text.startswith("@"):
+        return name, frozenset({" ".join(specifier_text.split())}), False
+    if not specifier_text:
+        return name, frozenset(), False
+
+    specifiers = []
+    upper_bounded = False
+    for clause in specifier_text.split(","):
+        clause_match = re.fullmatch(r"(===|~=|==|!=|<=|>=|<|>)\s*(\S+)", clause.strip())
+        if clause_match is None:
+            raise ValueError(f"Cannot parse version clause in requirement: {requirement!r}")
+        operator, version = clause_match.groups()
+        specifiers.append(f"{operator}{version}")
+        if operator in {"===", "~=", "==", "<=", "<"}:
+            upper_bounded = True
+    return name, frozenset(specifiers), upper_bounded
+
+
+def _requirement_specifier_map(
+    requirements: list[str],
+) -> tuple[dict[str, set[frozenset[str]]], list[str]]:
+    specifiers_by_name: dict[str, set[frozenset[str]]] = {}
+    unbounded = []
+    for requirement in requirements:
+        name, specifiers, upper_bounded = _parse_requirement_specifiers(requirement)
+        specifiers_by_name.setdefault(name, set()).add(specifiers)
+        if not upper_bounded:
+            unbounded.append(requirement.strip())
+    return specifiers_by_name, sorted(set(unbounded))
+
+
+def _format_specifier_sets(specifier_sets: set[frozenset[str]]) -> str:
+    formatted = [",".join(sorted(specifiers)) or "(none)" for specifiers in specifier_sets]
+    return " | ".join(sorted(formatted))
+
+
+def _check_dependency_parity(script_path: Path, pyproject_path: Path) -> tuple[bool, str]:
+    inline_requirements = _read_pep_723_dependencies(script_path)
+    core_requirements, optional_requirements = _read_project_dependencies(pyproject_path)
+    project_requirements = core_requirements + optional_requirements
+
+    inline_specs, inline_unbounded = _requirement_specifier_map(inline_requirements)
+    core_specs, _ = _requirement_specifier_map(core_requirements)
+    project_specs, project_unbounded = _requirement_specifier_map(project_requirements)
+    optional_specs, _ = _requirement_specifier_map(optional_requirements)
+
+    issues = []
+    if inline_unbounded:
+        issues.append(f"inline requirements without upper bounds: {', '.join(inline_unbounded)}")
+    if project_unbounded:
+        issues.append(f"pyproject.toml requirements without upper bounds: {', '.join(project_unbounded)}")
+
+    missing_core = sorted(core_specs.keys() - inline_specs.keys())
+    if missing_core:
+        issues.append(f"core distributions missing from inline metadata: {', '.join(missing_core)}")
+    undeclared_inline = sorted(inline_specs.keys() - core_specs.keys() - optional_specs.keys())
+    if undeclared_inline:
+        issues.append(
+            "inline-only distributions missing from project.optional-dependencies: "
+            f"{', '.join(undeclared_inline)}"
+        )
+
+    for source_name, specifier_map in (
+        ("inline metadata", inline_specs),
+        ("pyproject.toml", project_specs),
+    ):
+        for name, specifier_sets in sorted(specifier_map.items()):
+            if len(specifier_sets) > 1:
+                issues.append(
+                    f"conflicting {source_name} specifiers for {name}: "
+                    f"{_format_specifier_sets(specifier_sets)}"
+                )
+
+    shared_names = inline_specs.keys() & project_specs.keys()
+    for name in sorted(shared_names):
+        if inline_specs[name] != project_specs[name]:
+            issues.append(
+                f"specifier mismatch for {name}: "
+                f"inline={_format_specifier_sets(inline_specs[name])}; "
+                f"pyproject.toml={_format_specifier_sets(project_specs[name])}"
+            )
+
+    if issues:
+        return False, "; ".join(issues)
+    return (
+        True,
+        f"{len(inline_requirements)} inline and {len(project_requirements)} project requirements "
+        f"are upper-bounded; {len(core_specs)} core distributions covered; "
+        f"{len(shared_names)} shared specifier sets agree",
+    )
+
+
+async def _registered_tool_names(server: Any) -> list[str]:
+    return [tool.name for tool in await server.list_tools()]
+
+
+def _check_tool_registration(server: Any, expected_names: tuple[str, ...]) -> tuple[bool, str]:
+    """Assert the exposed tool surface matches the expected names exactly.
+
+    Compares the name sets rather than their sizes, so a renamed, dropped, or
+    added tool is caught. Duplicate registrations would collapse in a set, so
+    the count is checked alongside it.
+    """
+    actual = asyncio.run(_registered_tool_names(server))
+    expected = set(expected_names)
+    found = set(actual)
+    missing = sorted(expected - found)
+    unexpected = sorted(found - expected)
+
+    if missing or unexpected or len(actual) != len(found):
+        parts = []
+        if missing:
+            parts.append(f"missing: {', '.join(missing)}")
+        if unexpected:
+            parts.append(f"unexpected: {', '.join(unexpected)}")
+        if len(actual) != len(found):
+            parts.append("duplicate tool names registered")
+        return False, "; ".join(parts)
+
+    return True, f"registered={len(actual)}, all names match"
+
+
+def _read_database_stats(database_path: Path) -> tuple[int, int | None]:
+    database_uri = f"{database_path.resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(database_uri, uri=True)
+    try:
+        paper_row = conn.execute("SELECT COUNT(*) FROM papers").fetchone()
+        version_row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        if paper_row is None:
+            raise RuntimeError("papers count query returned no row")
+        return int(paper_row[0]), version_row[0] if version_row else None
+    finally:
+        conn.close()
+
+
+def _check_database(database_path: Path, expected_version: int) -> tuple[bool, str]:
+    paper_count, schema_version = _read_database_stats(database_path)
+    details = (
+        f"path={database_path}, papers={paper_count}, "
+        f"schema_version={schema_version}, expected_schema_version={expected_version}"
+    )
+    return schema_version == expected_version, details
+
+
+def _check_configured_database() -> tuple[bool, str]:
+    conn = _init_db()
+    conn.close()
+    return _check_database(PAPERS_DB_PATH, _SCHEMA_VERSION)
+
+
+def _check_sqlite_vec_loadability() -> tuple[bool, str]:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        version_row = conn.execute("SELECT vec_version()").fetchone()
+        if version_row is None or not version_row[0]:
+            raise RuntimeError("vec_version() returned no version")
+        return True, f"extension_version={version_row[0]}"
+    finally:
+        conn.close()
+
+
+def _check_referenced_paths(
+    project_root: Path,
+    referenced_paths: tuple[str, ...] = _SELFTEST_REFERENCED_PATHS,
+) -> tuple[bool, str]:
+    missing = [path for path in referenced_paths if not (project_root / path).is_file()]
+    if missing:
+        return False, f"missing: {', '.join(missing)}"
+    return True, f"{len(referenced_paths)} files present"
+
+
+def _check_import_health() -> tuple[bool, str]:
+    version = importlib.metadata.version("mcp")
+    if not version:
+        raise RuntimeError("importlib.metadata returned an empty mcp version")
+    return True, f"mcp={version}"
+
+
+def _run_selftest() -> int:
+    project_root = Path(__file__).resolve().parent
+    checks = (
+        ("IMPORT HEALTH", _check_import_health),
+        ("TOOL REGISTRATION", lambda: _check_tool_registration(mcp, EXPECTED_TOOL_NAMES)),
+        ("DATABASE", _check_configured_database),
+        ("SQLITE-VEC LOADABILITY", _check_sqlite_vec_loadability),
+        (
+            "REFERENCED-PATH INTEGRITY",
+            lambda: _check_referenced_paths(project_root),
+        ),
+        (
+            "DEPENDENCY PARITY",
+            lambda: _check_dependency_parity(
+                project_root / "server.py",
+                project_root / "pyproject.toml",
+            ),
+        ),
+    )
+
+    failures = 0
+    for name, check in checks:
+        try:
+            passed, detail = check()
+        except Exception as exc:
+            passed = False
+            detail = f"{type(exc).__name__}: {exc}"
+        print(f"{name}: {'PASS' if passed else 'FAIL'} - {detail}")
+        if not passed:
+            failures += 1
+
+    if failures:
+        print(f"SELFTEST: FAIL ({failures} failures)")
+        return 1
+    print("SELFTEST: PASS")
+    return 0
+
+
 def main() -> None:
     """Console-script entry point. Runs the MCP server over stdio.
 
@@ -8743,4 +9083,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--selftest"]:
+        sys.exit(_run_selftest())
     main()
