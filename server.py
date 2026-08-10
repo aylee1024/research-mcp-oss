@@ -891,6 +891,19 @@ def _fts5_ladder(query: str) -> list[tuple[str, str]]:
     return [r for r in rungs if not (r[1] in seen or seen.add(r[1]))]
 
 
+def _quotation_terms(text: str) -> list[str]:
+    """The distinct content words of a quotation, in order of first appearance.
+
+    Distinct, because coverage counts how many of the quotation's words a
+    passage contains, and a word repeated in the quotation is still one word to
+    find. Counting it twice in the denominator makes a quotation unable to
+    reach full coverage against its own source text.
+    """
+    tokens = [t.casefold() for t in _fts5_tokenize(text)]
+    content = [t for t in tokens if t not in _FTS_STOPWORDS] or tokens
+    return list(dict.fromkeys(content))
+
+
 def _quotation_coverage(content: list[str], passage: str) -> float:
     """The share of a quotation's words found together in one stretch of a passage.
 
@@ -904,9 +917,13 @@ def _quotation_coverage(content: list[str], passage: str) -> float:
     A real quotation's words occur *together*, so the score is the largest
     number of distinct quotation words falling inside a single window of the
     passage, sized to the quotation with room for the drift that extraction
-    introduces. That separates the two cleanly: genuine quotations score 0.80 at
+    introduces. That separates the two cleanly: genuine quotations score 1.00 at
     the fifth percentile against their source, while fabricated ones top out at
-    0.40 anywhere in the corpus.
+    0.50 anywhere in the corpus.
+
+    Terms are counted distinct on both sides. A word the quotation repeats is
+    still one word to find, and counting it twice in the denominator would stop
+    a quotation reaching full coverage against its own source text.
     """
     if not content:
         return 0.0
@@ -948,8 +965,7 @@ def _filter_by_token_coverage(
     Results are ordered by coverage, since a passage holding 95% of a quotation
     is a better answer than one holding 40% of it with a rarer word.
     """
-    wanted = [t.casefold() for t in _fts5_tokenize(text)]
-    content = [t for t in wanted if t not in _FTS_STOPWORDS] or wanted
+    content = _quotation_terms(text)
     if not content:
         return [], {}
 

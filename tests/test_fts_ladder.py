@@ -532,6 +532,14 @@ def test_coverage_survives_the_extra_tokens_extraction_introduces():
     assert server._quotation_coverage(content, corrupted) >= server._FUZZY_MIN_COVERAGE
 
 
+def test_a_quotation_fully_covers_its_own_text_even_when_it_repeats_words():
+    """Counting a repeated word twice in the denominator caps a self-match below 1.0."""
+    repetitive = "a wall thickness of 0.05 cm and a wall thickness of 0.1 cm"
+    terms = server._quotation_terms(repetitive)
+    assert len(terms) == len(set(terms))
+    assert server._quotation_coverage(terms, repetitive) == 1.0
+
+
 def test_coverage_of_a_passage_sharing_nothing_is_zero():
     content = [t.casefold() for t in server._fts5_tokenize(QUOTATION)]
     assert server._quotation_coverage(content, "photosynthesis in deep ocean vents") == 0.0
