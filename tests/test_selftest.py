@@ -146,6 +146,68 @@ def test_database_check_accepts_empty_current_schema(tmp_path):
     assert f"schema_version={server._SCHEMA_VERSION}" in detail
 
 
+def test_vector_knn_check_accepts_the_k_values_this_repo_uses():
+    passed, detail = server._check_vector_knn_limits(PROJECT_ROOT / "server.py")
+    assert passed is True, detail
+    assert "accepted" in detail
+
+
+def test_vector_knn_check_catches_a_k_the_index_will_refuse(tmp_path):
+    """Widening k past the index ceiling deletes a search leg instead of widening it."""
+    source = tmp_path / "server.py"
+    source.write_text(
+        "SELECT rowid FROM v WHERE embedding MATCH ? AND k = 5000\n", encoding="utf-8"
+    )
+    passed, detail = server._check_vector_knn_limits(source)
+    assert passed is False
+    assert "k=5000" in detail
+    assert "silently drops" in detail
+
+
+def test_vector_knn_check_fails_when_it_stops_matching_any_query(tmp_path):
+    """A check that examines nothing would otherwise report success forever."""
+    source = tmp_path / "server.py"
+    source.write_text("# the SQL was reformatted and k is now bound\n", encoding="utf-8")
+    passed, detail = server._check_vector_knn_limits(source)
+    assert passed is False
+    assert "stopped matching" in detail
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["AND k=8000", "and  k  =  8000", "AND\n                  k = 8000"],
+)
+def test_vector_knn_check_survives_reformatting_of_the_query(tmp_path, spelling):
+    """The gate must not go blind the first time someone reflows the SQL."""
+    source = tmp_path / "server.py"
+    source.write_text(f"SELECT rowid FROM v WHERE embedding MATCH ? {spelling}\n", encoding="utf-8")
+    passed, detail = server._check_vector_knn_limits(source)
+    assert passed is False
+    assert "k=8000" in detail
+
+
+def test_vector_knn_check_resolves_an_interpolated_k(tmp_path):
+    source = tmp_path / "server.py"
+    source.write_text(
+        "f'SELECT rowid FROM v WHERE embedding MATCH ? AND k = {MAX_VEC_KNN_K}'\n",
+        encoding="utf-8",
+    )
+    passed, detail = server._check_vector_knn_limits(source)
+    assert passed is True
+    assert "1 KNN queries" in detail
+
+
+def test_vector_knn_check_refuses_a_k_it_cannot_resolve(tmp_path):
+    """An unresolvable name means the gate cannot say what k the query asks for."""
+    source = tmp_path / "server.py"
+    source.write_text(
+        "f'SELECT rowid FROM v WHERE embedding MATCH ? AND k = {WIDER_K}'\n", encoding="utf-8"
+    )
+    passed, detail = server._check_vector_knn_limits(source)
+    assert passed is False
+    assert "cannot resolve" in detail
+
+
 def test_referenced_path_check_reports_missing_path(tmp_path):
     present_path = tmp_path / "present.py"
     present_path.touch()

@@ -22,6 +22,7 @@ import asyncio
 import gzip
 import hashlib
 import importlib.metadata
+import inspect
 import json
 import os
 import re
@@ -33,10 +34,11 @@ import sys
 import tarfile
 import time
 import tomllib
+import unicodedata
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urljoin, quote
 
 import httpx
@@ -722,18 +724,269 @@ def _paper_embed_text(
     return None
 
 
-def _fts5_safe_query(conn: sqlite3.Connection, sql: str, query: str, limit: int) -> list:
-    """Run an FTS5 MATCH query, falling back to quoted literal on syntax error."""
-    try:
-        return conn.execute(sql, (query, limit)).fetchall()
-    except sqlite3.OperationalError:
-        # Query contains FTS5 syntax chars like ( ) " AND OR NOT *
-        # Fall back to quoting the entire query as a literal phrase
-        escaped = '"' + query.replace('"', '""') + '"'
+# ---------------------------------------------------------------------------
+# FTS5 query construction
+#
+# A natural-language query cannot be handed to MATCH unchanged. Parentheses,
+# quotation marks and hyphens are FTS5 operators, so the raw string is either a
+# syntax error or — worse — a silently different query. Quoting the whole thing
+# instead turns it into one long phrase that no document contains, which fails
+# by returning nothing rather than by raising.
+#
+# The ladder below builds explicit MATCH expressions from the query's terms and
+# walks them from most precise to most permissive, accumulating results until it
+# has enough. Terms are always emitted inside a quoted string, so FTS5's own
+# tokenizer does the real work — including the diacritic folding and case
+# folding that unicode61 applies to the index.
+# ---------------------------------------------------------------------------
+
+# Every rung below is built from the query's terms. The caller's raw string is
+# never passed to MATCH, deliberately: an uppercase word inside ordinary prose
+# is a boolean operator to FTS5, so "the Court did NOT find the treaty binding"
+# parses as a set subtraction and returns the opposite of what was asked, with
+# no error to reveal it. Emphatic capitals and acronyms are common in legal and
+# scientific writing, and these tools document their input as search terms
+# rather than as FTS5 expressions.
+
+# Terms too common to discriminate between documents. They are dropped from the
+# NEAR and disjunction rungs: scanning the index's longest posting lists for
+# "the" adds no ranking signal, because BM25 gives a term appearing in most
+# documents almost no weight, and inside a NEAR window they only consume
+# proximity budget. The phrase rung keeps them, since a phrase must be verbatim.
+_FTS_STOPWORDS = frozenset(
+    """
+    a about an and are as at be been being but by can could did do does for from
+    had has have having he her him his how i if in into is it its me more most my
+    no nor not of on or our out over she should so some such than that the their
+    them then there these they this those through to too under up was we were
+    what when where which while who whom why will with would you your
+    """.split()
+)
+
+# NEAR requires every term inside one window, so it is only meaningful for short
+# queries. A 25-term claim cannot fit any sane window and the rung is skipped.
+_FTS_NEAR_MAX_TERMS = 8
+_FTS_NEAR_WINDOWS = (10, 30)
+
+# There is deliberately no conjunction rung between NEAR and the disjunction.
+# Requiring every content term is a weak signal on a long query — many
+# documents satisfy it without being the source — and because rungs are
+# concatenated, those documents displace the disjunction's best hit. Measured
+# on 167 benchmark claims, adding that rung costs 8 points of rank-1 accuracy
+# (78 → 70) and moves the median rank of the cited paper from 1 to 2, while
+# recall is identical: its result set is a subset of the disjunction's, so it
+# can only reorder, never find. BM25 over the disjunction already weights rare
+# terms, which is the discrimination a conjunction was reaching for.
+
+# Upper bound on terms fed to the wide rungs. Pasting several paragraphs into a
+# search should cost a bounded number of posting-list scans.
+_FTS_MAX_TERMS = 60
+
+# The share of a quotation's content words a passage must actually contain
+# before a fuzzy quotation match is reported. The bottom rung of the ladder is
+# a disjunction, so without a floor a passage sharing one uncommon word would
+# come back carrying a page number — and a page number from this tool becomes a
+# pin cite. "Most of the tokens" is the documented contract; this is the floor
+# that enforces it, and the measured share travels with every result so the
+# caller can apply a stricter one.
+_FUZZY_MIN_COVERAGE = 0.6
+
+# The share of reranked candidates falling back to their abstract that stops
+# being routine and starts indicating a broken chunk index. Measured on this
+# corpus, a healthy wide search sits around a third.
+_CHUNK_FALLBACK_ALARM = 0.5
+
+
+class FtsDiagnostics(NamedTuple):
+    """What the lexical leg actually did, so callers can report degradation.
+
+    `tier` names the most precise rung that contributed rows and doubles as a
+    confidence signal: an `exact_phrase` hit is a verbatim occurrence, while
+    `any_term` means only BM25 term overlap survived.
+    """
+
+    tier: str
+    tiers_tried: tuple[str, ...]
+    rows: int
+    terms: int
+    degraded: str | None = None
+    errored_rungs: tuple[str, ...] = ()
+
+
+def _fts5_tokenize(text: str) -> list[str]:
+    """Split text where unicode61 splits it.
+
+    Only the boundaries matter. Case and diacritics are left alone because every
+    term goes back to FTS5 inside a quoted string, and FTS5 folds both — but a
+    boundary in the wrong place is not recoverable. Splitting one indexed token
+    into two query terms asks for words the index does not contain and matches
+    nothing; joining two is merely narrower, because a quoted string holding two
+    tokens is a phrase.
+
+    Two rules beyond "alphanumeric" are needed to land on the same boundaries:
+
+    - Compose first. unicode61 discards the combining marks that form precomposed
+      Latin, Greek and Cyrillic letters without breaking the token, so decomposed
+      "Echeverria" is one indexed token; treating a bare combining acute as a
+      separator would split it into two. Composing to NFC reproduces exactly that
+      set, and leaves the marks that have no precomposed form — Devanagari
+      matras, Hebrew nikud — as the separators unicode61 also treats them as.
+    - Keep private-use characters. unicode61 counts them as token characters, and
+      PDF extraction scatters them through this corpus; dropping one splits the
+      word it sits in.
+
+    Verified against a live fts5 index on the shapes this corpus actually
+    contains — see tests/test_fts_ladder.py.
+    """
+    tokens: list[str] = []
+    current: list[str] = []
+    for char in unicodedata.normalize("NFC", text):
+        if char.isalnum() or unicodedata.category(char) == "Co":
+            current.append(char)
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _fts5_string(term: str) -> str:
+    return '"' + term.replace('"', '""') + '"'
+
+
+def _fts5_ladder(query: str) -> list[tuple[str, str]]:
+    """Build the (tier name, MATCH expression) rungs for a query, most precise first."""
+    tokens = _fts5_tokenize(query)
+    if not tokens:
+        return []
+
+    content = [t for t in tokens if t.casefold() not in _FTS_STOPWORDS]
+    # A query made entirely of stopwords still deserves a lexical attempt.
+    if not content:
+        content = tokens
+    content = content[:_FTS_MAX_TERMS]
+
+    rungs: list[tuple[str, str]] = [("exact_phrase", _fts5_string(" ".join(tokens)))]
+    if 2 <= len(content) <= _FTS_NEAR_MAX_TERMS:
+        joined = " ".join(_fts5_string(t) for t in content)
+        for window in _FTS_NEAR_WINDOWS:
+            rungs.append((f"near_{window}", f"NEAR({joined}, {window})"))
+    rungs.append(("any_term", " OR ".join(_fts5_string(t) for t in content)))
+
+    # A one-term query produces the same MATCH expression at several rungs.
+    # Running it more than once costs a query and returns rows already seen.
+    seen: set[str] = set()
+    return [r for r in rungs if not (r[1] in seen or seen.add(r[1]))]
+
+
+def _filter_by_token_coverage(
+    text: str, rows: list, limit: int
+) -> tuple[list, dict]:
+    """Keep only passages that actually contain most of `text`, best first.
+
+    The ladder's bottom rung is a disjunction, so it will return a passage that
+    shares a single uncommon word. That is the right behaviour for topical
+    search and the wrong behaviour for a quotation, because every result here
+    carries a page number and a page number from this tool becomes a pin cite.
+    Coverage is measured directly against the passage text — exact, not a
+    ranking heuristic — and results are ordered by it, since a passage holding
+    95% of a quotation is a better answer than one holding 40% of it with a
+    rarer word.
+    """
+    wanted = [t.casefold() for t in _fts5_tokenize(text)]
+    content = [t for t in wanted if t not in _FTS_STOPWORDS] or wanted
+    if not content:
+        return [], {}
+
+    scored = []
+    for row in rows:
+        present = {t.casefold() for t in _fts5_tokenize(row[1])}
+        coverage = sum(1 for t in content if t in present) / len(content)
+        if coverage >= _FUZZY_MIN_COVERAGE:
+            scored.append((coverage, row))
+    scored.sort(key=lambda pair: -pair[0])
+    kept = scored[:limit]
+    return [row for _, row in kept], {row[0]: coverage for coverage, row in kept}
+
+
+def _fts5_search(
+    conn: sqlite3.Connection,
+    sql: str,
+    query: str,
+    limit: int,
+    params: tuple = (),
+    rungs: tuple[str, ...] | None = None,
+) -> tuple[list, FtsDiagnostics]:
+    """Run `sql` against the ladder and return deduplicated rows, best rung first.
+
+    `sql` binds the MATCH expression, then anything in `params`, then the LIMIT,
+    and its first column must identify the row. Rungs are tried in order and
+    their results concatenated, so a document matched verbatim outranks one that
+    merely shares terms, and the wide rung at the bottom fills the remaining
+    slots by BM25. `rungs` restricts which rungs run, for callers that want only
+    the precise end of the ladder.
+    """
+    ladder = _fts5_ladder(query)
+    if rungs is not None:
+        selected = [rung for rung in ladder if rung[0] in rungs]
+        if ladder and not selected:
+            # Renaming a rung would otherwise turn a restricted caller — exact
+            # quotation search, say — into one that silently matches nothing.
+            return [], FtsDiagnostics(
+                "none", (), 0, len(_fts5_tokenize(query)),
+                f"no rung named {sorted(rungs)} exists in the ladder",
+            )
+        ladder = selected
+    if not ladder:
+        return [], FtsDiagnostics("none", (), 0, 0, "query has no indexable terms")
+
+    seen: set = set()
+    rows: list = []
+    tried: list[str] = []
+    errored: list[str] = []
+    first_hit: str | None = None
+
+    for tier, expression in ladder:
+        if len(rows) >= limit:
+            break
+        tried.append(tier)
         try:
-            return conn.execute(sql, (escaped, limit)).fetchall()
-        except sqlite3.OperationalError:
-            return []
+            candidates = conn.execute(sql, (expression, *params, limit)).fetchall()
+        except sqlite3.OperationalError as exc:
+            # Every rung is built from quoted strings and operators, so none of
+            # them should be unparseable. Record it rather than dropping it: a
+            # rung that vanishes silently narrows the search and reports health,
+            # which is the defect this whole ladder exists to remove.
+            errored.append(f"{tier}: {exc}")
+            continue
+        for row in candidates:
+            if row[0] in seen:
+                continue
+            seen.add(row[0])
+            rows.append(row)
+            if len(rows) >= limit:
+                break
+        if candidates and first_hit is None:
+            first_hit = tier
+
+    term_count = len(_fts5_tokenize(query))
+    broken = "; ".join(errored)
+    if first_hit is None:
+        reason = (
+            f"no lexical match at any tier (rungs that failed to run: {broken})"
+            if broken
+            else "no lexical match at any tier"
+        )
+        return [], FtsDiagnostics("none", tuple(tried), 0, term_count, reason, tuple(errored))
+    return rows, FtsDiagnostics(
+        first_hit,
+        tuple(tried),
+        len(rows),
+        term_count,
+        f"rungs that failed to run: {broken}" if broken else None,
+        tuple(errored),
+    )
 
 
 # Phase A.4 (plan v3 §3, post-bench tuning): reranker latency + candidate-count guards.
@@ -756,6 +1009,11 @@ def _fts5_safe_query(conn: sqlite3.Connection, sql: str, query: str, limit: int)
 # them. Default raised to 500 (effectively unlimited on current corpus)
 # while preserving telemetry; configurable via RESEARCH_MCP_RERANK_CAP
 # env var for latency-bound use cases.
+# sqlite-vec rejects a KNN query whose k exceeds this, and the rejection is an
+# OperationalError that the search paths catch and log — so an over-large k does
+# not widen the search, it deletes that leg of it entirely and silently.
+MAX_VEC_KNN_K = 4096
+
 MAX_RERANK_CANDIDATES = int(os.environ.get("RESEARCH_MCP_RERANK_CAP", "500"))
 RERANK_SLOW_LATENCY_S = 5.0
 _rerank_metrics: dict[str, float | int] = {
@@ -773,8 +1031,17 @@ _rerank_metrics: dict[str, float | int] = {
 _rerank_metrics_lock = threading.Lock()
 
 
-def _rerank(query: str, candidates: list[tuple[str, str]], top_k: int = 30) -> list[int]:
-    """Rerank candidates using cross-encoder. Returns indices sorted by relevance.
+def _rerank(
+    query: str, candidates: list[tuple[str, str]], top_k: int = 30
+) -> list[tuple[int, float]]:
+    """Rerank candidates using a cross-encoder.
+
+    Returns (index, score) pairs sorted by relevance, where the index maps back
+    into the original candidate list. The raw score travels with the index
+    because rank position alone cannot express confidence: reciprocal-rank
+    fusion at k=60 flattens the gap between a decisive match and a marginal one
+    to a few thousandths, so a caller blending ranks has no way to tell them
+    apart. Anything that wants to fuse, threshold, or abstain needs the score.
 
     Phase A.4: caps candidates at MAX_RERANK_CANDIDATES (default 500;
     env-configurable via RESEARCH_MCP_RERANK_CAP)
@@ -819,7 +1086,7 @@ def _rerank(query: str, candidates: list[tuple[str, str]], top_k: int = 30) -> l
             )
 
     ranked_indices = sorted(range(len(scores)), key=lambda i: -scores[i])
-    return ranked_indices[:top_k]
+    return [(i, float(scores[i])) for i in ranked_indices[:top_k]]
 
 
 def get_rerank_metrics() -> dict[str, float | int]:
@@ -5716,35 +5983,45 @@ async def check_jstor(
 
     conn = sqlite3.connect(str(JSTOR_DB_PATH))
     conn.row_factory = sqlite3.Row
-    def _jstor_fts_safe(sql: str, fts_query: str, extra_params: tuple = ()) -> list:
-        """Run JSTOR FTS5 MATCH query with safe fallback on syntax error."""
-        try:
-            return conn.execute(sql, (fts_query,) + extra_params).fetchall()
-        except sqlite3.OperationalError:
-            escaped = '"' + fts_query.replace('"', '""') + '"'
-            try:
-                return conn.execute(sql, (escaped,) + extra_params).fetchall()
-            except sqlite3.OperationalError:
-                return []
+    def _jstor_lookup(sql: str, title_query: str, row_limit: int, filters: tuple = ()) -> list:
+        """Look a title up in the JSTOR index.
+
+        A title carrying a colon, an ampersand or a parenthesis is FTS5 syntax,
+        so passing it raw used to raise and the whole-title phrase that replaced
+        it matched only a byte-identical title. The ladder's precise rungs fix
+        that. Its widest rung is deliberately excluded: this answers "is this
+        specific article in JSTOR", and a disjunction over a title's words
+        returns articles that merely share vocabulary — reported to the caller
+        as a match, complete with someone else's DOI.
+        """
+        rows, _ = _fts5_search(
+            conn,
+            sql,
+            title_query,
+            row_limit,
+            params=filters,
+            rungs=("exact_phrase", "near_10", "near_30"),
+        )
+        return rows
 
     try:
         results = []
         if title and issn:
             # FTS5 search filtered by ISSN
             clean_issn = re.sub(r"[^0-9Xx]", "", issn)
-            results = _jstor_fts_safe("""
+            results = _jstor_lookup("""
                 SELECT a.*, rank FROM jstor_fts f
                 JOIN jstor_articles a ON a.rowid = f.rowid
                 WHERE jstor_fts MATCH ? AND (a.print_issn = ? OR a.online_issn = ?)
                 ORDER BY rank LIMIT ?
-            """, title, (clean_issn, clean_issn, limit))
+            """, title, limit, (clean_issn, clean_issn))
         elif title:
-            results = _jstor_fts_safe("""
+            results = _jstor_lookup("""
                 SELECT a.*, rank FROM jstor_fts f
                 JOIN jstor_articles a ON a.rowid = f.rowid
                 WHERE jstor_fts MATCH ?
                 ORDER BY rank LIMIT ?
-            """, title, (limit,))
+            """, title, limit)
         elif issn:
             clean_issn = re.sub(r"[^0-9Xx]", "", issn)
             rows = conn.execute("""
@@ -6139,6 +6416,12 @@ async def search_local(query: str, limit: int = 20, rerank_on: str = "chunk", st
             backward compatibility.
     """
     conn = _init_db()
+    # Every leg below degrades by returning fewer results rather than by
+    # raising, so a half-blind search is indistinguishable from a thorough one
+    # that found little. Anything that silently narrows the search is recorded
+    # here as (code, explanation) and reported alongside the results: the code
+    # is what a calling program branches on, the explanation is for a reader.
+    degraded: list[tuple[str, str]] = []
     try:
         # Eligibility filter. rerank_on="chunk" requires a paper to have full
         # text (otherwise chunk-based rerank has nothing to score). rerank_on=
@@ -6166,7 +6449,7 @@ async def search_local(query: str, limit: int = 20, rerank_on: str = "chunk", st
         # dominates because author names and key terms routinely appear
         # in titles, and the long-tail book chapters that the lower title
         # weight would help are not the modal query shape.
-        fts_results = _fts5_safe_query(conn, f"""
+        fts_results, fts_diag = _fts5_search(conn, f"""
             SELECT p.paper_id, p.rowid
             FROM papers_fts fts
             JOIN papers p ON fts.paper_id = p.paper_id
@@ -6176,15 +6459,18 @@ async def search_local(query: str, limit: int = 20, rerank_on: str = "chunk", st
             LIMIT ?
         """, query, 300)
         fts_ranks = {row[0]: i + 1 for i, row in enumerate(fts_results)}
+        if fts_diag.degraded:
+            degraded.append(("lexical_leg_empty", f"keyword search returned nothing: {fts_diag.degraded}"))
 
         # 2a. Vector similarity search on paper-level embeddings.
         # KNN + post-filter: vec_papers is populated for all verified rows
         # (~15.9K), but only ~2.9K of those are has_full_text=1 (18% ratio).
-        # Phase 3.2: widen k from 2500 → 5000. The post-eligibility filter
-        # reduces ~5000 KNN hits to ~900 cite-ready papers (18% ratio); the
-        # prior 2500 → ~450, which clipped the expected paper out of the
-        # 300-slot candidate pool on 5 of 49 benchmark claims. Cost: ~100ms
-        # per query at CPU-embedded KNN scale.
+        # k is the widest the vector index will accept. The post-eligibility
+        # filter reduces the KNN hits to roughly a fifth (only ~18% of embedded
+        # papers are cite-ready), so a narrow k clips the expected paper out of
+        # the 300-slot candidate pool. Cost: ~100ms per query at CPU-embedded
+        # KNN scale. Asking for more than MAX_VEC_KNN_K does not widen it
+        # further — it makes the query fail and drops this leg altogether.
         vec_ranks = {}
         query_emb = None
         try:
@@ -6193,7 +6479,7 @@ async def search_local(query: str, limit: int = 20, rerank_on: str = "chunk", st
             vec_results = conn.execute(f"""
                 SELECT v.rowid, v.distance
                 FROM {vec_papers_t} v
-                WHERE v.embedding MATCH ? AND k = 5000
+                WHERE v.embedding MATCH ? AND k = {MAX_VEC_KNN_K}
                 ORDER BY v.distance
             """, (query_emb,)).fetchall()
             # Batch-map rowids to paper_ids, filter to the same eligibility as FTS.
@@ -6220,6 +6506,7 @@ async def search_local(query: str, limit: int = 20, rerank_on: str = "chunk", st
                     vec_ranks[pid] = seq_rank
         except Exception as e:
             print(f"Vector search error: {e}", file=sys.stderr)
+            degraded.append(("embedder_unavailable", f"semantic search unavailable, keyword results only: {e}"))
 
         # 2b. Chunk-level vector search aggregated to papers.
         # For each paper, use its best-matching chunk as a signal. Helps books
@@ -6261,6 +6548,7 @@ async def search_local(query: str, limit: int = 20, rerank_on: str = "chunk", st
                     chunk_agg_ranks = {pid: i + 1 for i, (pid, _) in enumerate(sorted_pids)}
             except Exception as e:
                 print(f"Chunk aggregation error: {e}", file=sys.stderr)
+                degraded.append(("chunk_signal_unavailable", f"passage-level signal unavailable: {e}"))
 
         # 3. RRF fusion (keyword + paper-vector + chunk-aggregated). Hub signal
         # added after candidate selection below.
@@ -6283,7 +6571,13 @@ async def search_local(query: str, limit: int = 20, rerank_on: str = "chunk", st
         ranked_pids = sorted(rrf_scores.keys(), key=lambda p: -rrf_scores[p])[:300]
 
         if not ranked_pids:
-            return f"No local results for '{query}'. Try search_papers to search Semantic Scholar."
+            # An empty result and a broken retrieval leg look identical to the
+            # caller, so say which one this was.
+            note = "".join(f"\n  - [{code}] {detail}" for code, detail in degraded)
+            return (
+                f"No local results for '{query}'. Try search_papers to search "
+                f"Semantic Scholar." + (f"\nDEGRADED:{note}" if note else "")
+            )
 
         # 3b. Citation-graph hub scoring (weighted hub count over the seed set).
         # For each edge in paper_references where both endpoints are in the
@@ -6334,6 +6628,7 @@ async def search_local(query: str, limit: int = 20, rerank_on: str = "chunk", st
                     print(f"Hub scoring SQL error: {e}", file=sys.stderr)
             except Exception as e:
                 print(f"Hub scoring error: {e}", file=sys.stderr)
+                degraded.append(("hub_signal_unavailable", f"citation-graph signal unavailable: {e}"))
 
         # 4. Fetch full details for candidates. has_full_text flag comes from
         # the canonical schema column (1 iff processed_text OR tex_text >500
@@ -6411,12 +6706,29 @@ async def search_local(query: str, limit: int = 20, rerank_on: str = "chunk", st
                 f"(no chunk in top-1000)",
                 file=sys.stderr,
             )
+            # Some fallback is how the cascade works — a wide candidate pool
+            # always contains papers whose passages missed the chunk KNN, and
+            # reporting that every time would put a warning on every healthy
+            # search, which is the indistinguishability this reporting exists to
+            # remove. Only a majority indicates something actually wrong with
+            # the chunk index.
+            fallback_share = chunk_fallbacks / max(len(candidates), 1)
+            if fallback_share > _CHUNK_FALLBACK_ALARM:
+                degraded.append((
+                    "reranked_on_abstract",
+                    f"{chunk_fallbacks} of {len(candidates)} candidates "
+                    f"({fallback_share:.0%}) were reranked on their abstract because no "
+                    f"passage of theirs matched — the chunk index may be incomplete",
+                ))
 
+        rerank_scores: dict[str, float] = {}
         try:
-            reranked_indices = await asyncio.to_thread(_rerank, query, candidates, limit)
-            final_pids = [candidates[i][0] for i in reranked_indices]
+            reranked = await asyncio.to_thread(_rerank, query, candidates, limit)
+            final_pids = [candidates[i][0] for i, _ in reranked]
+            rerank_scores = {candidates[i][0]: score for i, score in reranked}
         except Exception as e:
             print(f"Rerank error: {e}", file=sys.stderr)
+            degraded.append(("reranker_failed", f"reranker failed, results are in raw fusion order: {e}"))
             final_pids = ranked_pids[:limit]
 
         # Phase 3.1 reverted: the rank-based blended re-injection
@@ -6487,6 +6799,7 @@ async def search_local(query: str, limit: int = 20, rerank_on: str = "chunk", st
                     "chunk_agg_rank": chunk_agg_ranks.get(pid),
                     "hub_rank": hub_ranks.get(pid),
                     "rerank_position": rerank_position.get(pid),
+                    "rerank_score": rerank_scores.get(pid),
                 },
                 "best_chunk_text": best_chunk_text.get(pid),
             })
@@ -6494,11 +6807,18 @@ async def search_local(query: str, limit: int = 20, rerank_on: str = "chunk", st
             "query": query,
             "rerank_on": rerank_on,
             "count": len(out),
+            "lexical_tier": fts_diag.tier,
+            "degraded": [{"code": code, "detail": detail} for code, detail in degraded],
             "results": out,
         }, indent=2)
 
     # 6. Format results
     parts = [f"Found {len(final_pids)} papers in local library (hybrid search):\n"]
+    if degraded:
+        parts.append(
+            "DEGRADED — this search ran with less than its full signal:\n"
+            + "".join(f"  - [{code}] {detail}\n" for code, detail in degraded)
+        )
     for i, pid in enumerate(final_pids, 1):
         if pid not in rows_by_pid:
             continue
@@ -6649,12 +6969,15 @@ async def search_passages(query: str, limit: int = 10, structured: bool = False)
             False preserves the existing markdown output.
     """
     conn = _init_db()
+    # See search_local: every leg here fails by narrowing rather than raising,
+    # so anything that quietly shrank the search is recorded and reported.
+    degraded: list[tuple[str, str]] = []
     try:
         # 1. FTS5 keyword search on chunks. Filter to cite-ready papers
         # (has_full_text=1) — v8 semantics: verified means source-known,
         # has_full_text means the paper has body text suitable for citation.
         # Passage search by definition wants the latter.
-        fts_results = _fts5_safe_query(conn, """
+        fts_results, fts_diag = _fts5_search(conn, """
             SELECT c.chunk_id
             FROM paper_chunks_fts fts
             JOIN paper_chunks c ON fts.rowid = c.chunk_id
@@ -6665,6 +6988,8 @@ async def search_passages(query: str, limit: int = 10, structured: bool = False)
             LIMIT ?
         """, query, 300)
         fts_ranks = {row[0]: i + 1 for i, row in enumerate(fts_results)}
+        if fts_diag.degraded:
+            degraded.append(("lexical_leg_empty", f"keyword search returned nothing: {fts_diag.degraded}"))
 
         # 2. Vector similarity search on chunks
         vec_ranks = {}
@@ -6698,6 +7023,7 @@ async def search_passages(query: str, limit: int = 10, structured: bool = False)
                     vec_ranks[rowid] = seq_rank
         except Exception as e:
             print(f"Vector search error (passages): {e}", file=sys.stderr)
+            degraded.append(("embedder_unavailable", f"semantic search unavailable, keyword results only: {e}"))
 
         # 3. RRF fusion
         all_chunk_ids = set(fts_ranks.keys()) | set(vec_ranks.keys())
@@ -6716,7 +7042,13 @@ async def search_passages(query: str, limit: int = 10, structured: bool = False)
         ranked_cids = sorted(rrf_scores.keys(), key=lambda c: -rrf_scores[c])[:300]
 
         if not ranked_cids:
-            return f"No passages found for '{query}'. Try search_local for broader paper-level search, or search_papers for Semantic Scholar."
+            # Distinguish "nothing matched" from "a retrieval leg was broken".
+            note = "".join(f"\n  - [{code}] {detail}" for code, detail in degraded)
+            return (
+                f"No passages found for '{query}'. Try search_local for broader "
+                f"paper-level search, or search_papers for Semantic Scholar."
+                + (f"\nDEGRADED:{note}" if note else "")
+            )
 
         # 4. Fetch full chunk details
         placeholders = ",".join("?" for _ in ranked_cids)
@@ -6744,11 +7076,14 @@ async def search_passages(query: str, limit: int = 10, structured: bool = False)
             # char 500.
             candidates.append((cid, row[1][:2000]))
 
+        rerank_scores: dict[int, float] = {}
         try:
-            reranked_indices = await asyncio.to_thread(_rerank, query, candidates, limit)
-            final_cids = [candidates[i][0] for i in reranked_indices]
+            reranked = await asyncio.to_thread(_rerank, query, candidates, limit)
+            final_cids = [candidates[i][0] for i, _ in reranked]
+            rerank_scores = {candidates[i][0]: score for i, score in reranked}
         except Exception as e:
             print(f"Rerank error (passages): {e}", file=sys.stderr)
+            degraded.append(("reranker_failed", f"reranker failed, results are in raw fusion order: {e}"))
             final_cids = ranked_cids[:limit]
 
         rerank_position = {cid: i + 1 for i, cid in enumerate(final_cids)}
@@ -6792,16 +7127,24 @@ async def search_passages(query: str, limit: int = 10, structured: bool = False)
                     "fts_rank": fts_ranks.get(cid),
                     "vec_rank": vec_ranks.get(cid),
                     "rerank_position": rerank_position.get(cid),
+                    "rerank_score": rerank_scores.get(cid),
                 },
             })
         return json.dumps({
             "query": query,
             "count": len(out),
+            "lexical_tier": fts_diag.tier,
+            "degraded": [{"code": code, "detail": detail} for code, detail in degraded],
             "results": out,
         }, indent=2)
 
     # 6. Format results
     parts = [f"Found {len(final_cids)} matching passages (hybrid search):\n"]
+    if degraded:
+        parts.append(
+            "DEGRADED — this search ran with less than its full signal:\n"
+            + "".join(f"  - [{code}] {detail}\n" for code, detail in degraded)
+        )
     for i, cid in enumerate(final_cids, 1):
         if cid not in chunks_by_id:
             continue
@@ -6907,20 +7250,20 @@ async def find_quotation(
                 return f"Paper not found: '{paper_id}'."
             scope_pid = row[0]
 
-        # Build FTS5 query.
-        # Exact mode: quote as phrase. Double internal quotes per FTS5 escape rule.
-        # Fuzzy mode: tokenize on whitespace, strip punctuation, AND the tokens
-        # together (bag-of-words with implicit AND — FTS5 default).
-        if fuzzy:
-            tokens = re.findall(r"[A-Za-z0-9]+", text)
-            # Drop ultra-short tokens (FTS5 tokenizer may strip anyway) and
-            # obvious stop words for a cleaner bag.
-            tokens = [t for t in tokens if len(t) > 2]
-            if not tokens:
-                return "Error: no usable tokens in fuzzy query after stripping."
-            fts_query = " ".join(f'"{t}"' for t in tokens)
-        else:
-            fts_query = '"' + text.replace('"', '""') + '"'
+        # Both modes go through the query ladder, which composes the MATCH
+        # expression from the quotation's tokens. Punctuation inside a
+        # quotation — a parenthesis, an apostrophe, an em dash — is FTS5
+        # syntax, and passing it through raw used to raise an error that was
+        # then reported as "no matches": a false negative in a tool whose whole
+        # job is confirming that a source says what a citation claims.
+        #
+        # Exact mode runs the phrase rung alone, because the tool promises
+        # contiguity. Fuzzy mode walks the whole ladder, which is what "most of
+        # the tokens" means in practice and what recovers a quotation whose
+        # source text carries an extraction artifact — a split ligature turns
+        # one word into three tokens that no phrase or conjunction can match,
+        # while the surrounding words still rank the right passage first.
+        allowed_rungs = None if fuzzy else ("exact_phrase",)
 
         if scope_pid:
             sql = """
@@ -6938,10 +7281,14 @@ async def find_quotation(
                 ORDER BY rank
                 LIMIT ?
             """
-            try:
-                rows = conn.execute(sql, (fts_query, scope_pid, limit)).fetchall()
-            except sqlite3.OperationalError:
-                return f"No matches for that quotation in paper '{scope_pid}'."
+            rows, quote_diag = _fts5_search(
+                conn,
+                sql,
+                text,
+                limit * 3 if fuzzy else limit,
+                params=(scope_pid,),
+                rungs=allowed_rungs,
+            )
         else:
             sql = """
                 SELECT c.chunk_id, c.chunk_text, c.section_header,
@@ -6957,19 +7304,34 @@ async def find_quotation(
                 ORDER BY rank
                 LIMIT ?
             """
-            try:
-                rows = conn.execute(sql, (fts_query, limit)).fetchall()
-            except sqlite3.OperationalError:
-                return "No matches for that quotation."
+            rows, quote_diag = _fts5_search(
+                conn, sql, text, limit * 3 if fuzzy else limit, rungs=allowed_rungs
+            )
+
+        if fuzzy:
+            rows, coverage_by_chunk = _filter_by_token_coverage(text, rows, limit)
 
         if not rows:
             mode = "fuzzy" if fuzzy else "exact"
             scope = f" within paper {scope_pid}" if scope_pid else ""
+            if quote_diag.terms == 0:
+                return f"Error: no searchable words in that quotation{scope}."
+            if fuzzy and quote_diag.rows:
+                return (
+                    f"No fuzzy quotation matches{scope}: {quote_diag.rows} passages "
+                    f"shared some wording but none contained at least "
+                    f"{_FUZZY_MIN_COVERAGE:.0%} of the quotation. Use search_passages "
+                    f"for semantic search."
+                )
             return f"No {mode} quotation matches{scope}. Try the other mode or use search_passages for semantic search."
     finally:
         conn.close()
 
-    parts = [f"Found {len(rows)} match{'es' if len(rows) != 1 else ''} for {'fuzzy' if fuzzy else 'exact'} quotation:\n"]
+    # In fuzzy mode the rung that matched is the difference between a verbatim
+    # hit and a passage that merely shares vocabulary, so the caller sees it,
+    # alongside the share of the quotation each passage actually contains.
+    strength = "" if not fuzzy else f" [matched on: {quote_diag.tier}]"
+    parts = [f"Found {len(rows)} match{'es' if len(rows) != 1 else ''} for {'fuzzy' if fuzzy else 'exact'} quotation{strength}:\n"]
     for i, row in enumerate(rows, 1):
         (chunk_id, chunk_text, section, page_start, page_end,
          paper_id_row, title, authors_json, year, venue, doi,
@@ -6985,6 +7347,11 @@ async def find_quotation(
                 match_span = f"match_span: [{idx}, {idx + len(text)})"
 
         parts.append(f"--- Match {i} ---")
+        if fuzzy:
+            parts.append(
+                f"quotation_coverage: {coverage_by_chunk.get(chunk_id, 0.0):.0%} "
+                f"of the quotation's words appear in this passage"
+            )
         parts.append(f"**{title}** ({year})")
         if is_retracted:
             parts.append("⚠️ **RETRACTED** — do not cite without verification")
@@ -7170,6 +7537,9 @@ async def locate_claim_in_paper(
         best_chunk_id: int | None = None
         best_score: float = 0.0
         best_method = claim_type
+        # This tool answers with a page. If its strongest strategy fails, the
+        # page still comes back — from a weaker one — so say so beside it.
+        locator_degraded: str | None = None
 
         # Strategy A: verbatim_quote → shingle-based FTS5 phrase match
         if claim_type == "verbatim_quote":
@@ -7179,6 +7549,7 @@ async def locate_claim_in_paper(
                 # Claim too short for shingle scoring; fall back to size-3
                 shingles = _make_shingles(normalized_claim, size=3, stride=1)
             shingle_hits: dict[int, int] = {}  # chunk_id -> match count
+            unusable_shingles = 0
             placeholders = ",".join("?" for _ in chunk_ids)
             for shingle in shingles[:50]:  # cap per-claim shingle FTS cost
                 if len(shingle) < 10:
@@ -7194,6 +7565,11 @@ async def locate_claim_in_paper(
                     for (cid,) in rows:
                         shingle_hits[cid] = shingle_hits.get(cid, 0) + 1
                 except sqlite3.OperationalError:
+                    # Dropping a shingle lowers every chunk's score by the same
+                    # amount only if the drops are uniform, which they are not:
+                    # the shingles that fail are the ones carrying the claim's
+                    # punctuation. Count them so the page comes with a caveat.
+                    unusable_shingles += 1
                     continue
             if shingle_hits:
                 # Pick the chunk with the most matching shingles. Tie-break
@@ -7210,6 +7586,11 @@ async def locate_claim_in_paper(
                 )
                 best_score = float(shingle_hits[best_chunk_id])
                 best_method = f"shingle({len(shingles)})"
+                if unusable_shingles:
+                    locator_degraded = (
+                        f"{unusable_shingles} of {len(shingles[:50])} shingles could not be "
+                        f"searched, so this page was chosen from a partial match"
+                    )
 
         # Strategy B: semantic (embedding KNN + rerank) — used for non-
         # verbatim types and as a fallback when shingles miss.
@@ -7271,6 +7652,9 @@ async def locate_claim_in_paper(
                         best_method = "semantic+rerank"
             except Exception as e:
                 print(f"locate_claim_in_paper KNN error ({pid}): {e}", file=sys.stderr)
+                locator_degraded = (
+                    f"semantic locate unavailable, page comes from a weaker strategy: {e}"
+                )
 
         # Strategy C: fallback — plain LIKE on the original claim's first
         # 120 chars. Last resort; kept so we always return something
@@ -7341,6 +7725,8 @@ async def locate_claim_in_paper(
                 parts.append(f"(offset from printed: {pdf_offset})")
         parts.append(f"method: {best_method}")
         parts.append(f"score: {best_score:.4f}")
+        if locator_degraded:
+            parts.append(f"DEGRADED: {locator_degraded}")
         # Phase A.1: surface has_gapped_extraction so callers can decide
         # whether to trust the page (1 = no markers OR descending markers
         # OR TeX-only ⇒ pincite reliability is degraded).
@@ -8999,6 +9385,175 @@ def _check_configured_database() -> tuple[bool, str]:
     return _check_database(PAPERS_DB_PATH, _SCHEMA_VERSION)
 
 
+def _check_lexical_retrieval(database_path: Path) -> tuple[bool, str]:
+    """Confirm a natural-language query still reaches the lexical index.
+
+    An FTS5 index can be complete, consistent and queryable while search returns
+    nothing, because the failure lives in the query rather than the index:
+    punctuation makes the raw string a syntax error, and quoting it whole makes
+    it a phrase no document contains. Both fail by returning an empty list, so
+    the counts and MATCH probe stay green throughout.
+
+    Each probe is drawn from a real paper's own text and shaped to reach a
+    different rung, so the check exercises the precise end of the ladder and the
+    permissive end rather than one of them. The rung that fires is asserted, not
+    just reported: a ladder collapsed to its widest rung would otherwise still
+    answer every probe and look healthy.
+
+    Only the verbatim probe asserts a rank, and it asserts the weakest useful
+    one — that the paper is in the result set at all. A twelve-word span from a
+    single paper is unique in the corpus, so that assertion does not depend on
+    how many other documents compete for the top of the ranking.
+    """
+    if not database_path.is_file():
+        return False, f"{database_path} does not exist"
+
+    conn = sqlite3.connect(f"{database_path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        sources = conn.execute("""
+            SELECT paper_id, title, abstract
+            FROM papers
+            WHERE has_full_text = 1
+              AND LENGTH(title) > 20
+              AND LENGTH(abstract) > 300
+            ORDER BY rowid
+            LIMIT 1
+        """).fetchall()
+        if not sources:
+            # An empty library is a legitimate reason to skip. A library that
+            # has full-text papers whose title or abstract this probe cannot
+            # read is a schema fault, and must not be reported as health.
+            full_text = conn.execute(
+                "SELECT COUNT(*) FROM papers WHERE has_full_text = 1"
+            ).fetchone()[0]
+            if full_text:
+                return False, (
+                    f"{full_text} full-text papers exist but none has a title and "
+                    f"abstract this probe can read — check the schema"
+                )
+            return True, "library holds no full-text paper to probe with"
+
+        paper_id, title, abstract = sources[0]
+        words = abstract.split()
+        span = " ".join(words[:12])
+        tail = " ".join(words[12:24])
+
+        # (probe, rungs that would count as a pass, whether the source paper
+        # itself must come back).
+        #
+        # The first probe is the span with one stray quotation mark appended.
+        # That leaves the token stream identical, so the phrase still has to
+        # match, while making the string an unterminated FTS5 literal — the
+        # shape that used to raise and be reported as "no results".
+        probes = (
+            (f'{span}"', {"exact_phrase"}, True),
+            (f"{span} — {tail}", {"exact_phrase", "near_10", "near_30"}, False),
+            (f"How does {title} bear on {tail}?", {"any_term"}, False),
+        )
+
+        failures = []
+        observed = []
+        for probe, expected_tiers, must_find_source in probes:
+            rows, diag = _fts5_search(conn, """
+                SELECT p.paper_id
+                FROM papers_fts fts
+                JOIN papers p ON fts.paper_id = p.paper_id
+                WHERE papers_fts MATCH ?
+                  AND p.has_full_text = 1
+                ORDER BY bm25(papers_fts, 0.1, 10.0, 3.0, 3.0, 1.0, 0.0)
+                LIMIT ?
+            """, probe, 500)
+            observed.append(diag.tier)
+            if not rows:
+                failures.append(f"{diag.tier}: no rows ({diag.degraded})")
+            elif diag.tier not in expected_tiers:
+                failures.append(
+                    f"expected {'/'.join(sorted(expected_tiers))}, matched on {diag.tier}"
+                )
+            elif must_find_source and paper_id not in {row[0] for row in rows}:
+                failures.append(f"{diag.tier}: {len(rows)} rows but not the paper it came from")
+
+        if failures:
+            return False, "lexical search is not reaching the index — " + "; ".join(failures)
+        return True, f"{len(probes)} probes matched on {', '.join(observed)} as expected"
+    finally:
+        conn.close()
+
+
+def _check_vector_knn_limits(script_path: Path) -> tuple[bool, str]:
+    """Confirm every KNN query in this file asks for a k the vector index accepts.
+
+    sqlite-vec refuses a k above its own ceiling with an OperationalError, and
+    the search paths catch that error and continue. An over-large k therefore
+    does not widen the search — it removes that leg of it, quietly, for every
+    query. Widening k is the obvious tuning knob, which is what makes this
+    worth a gate.
+
+    The authority is sqlite-vec itself: each k found in the source is put to a
+    real KNN query against a scratch index.
+    """
+    source = script_path.read_text(encoding="utf-8")
+    # This function builds a KNN query of its own out of the values it is
+    # validating. Scanning it would re-validate the gate rather than the search
+    # paths, and its loop variable has no value to resolve.
+    source = source.replace(inspect.getsource(_check_vector_knn_limits), "")
+
+    # Match k however it is spelled: any spacing, either case, across a line
+    # break, and whether the value is a literal or an interpolated name. A gate
+    # that only recognises one spelling stops examining anything the first time
+    # someone reformats the SQL, and then reports success forever.
+    found = re.findall(r"(?i)\bAND\s+k\s*=\s*(\d+|\{[A-Za-z_][A-Za-z_0-9]*\})", source)
+    if not found:
+        return False, "no KNN query found in the source — the check has stopped matching"
+
+    literals: set[int] = set()
+    unresolved: list[str] = []
+    for value in found:
+        if value.isdigit():
+            literals.add(int(value))
+            continue
+        # An interpolated name has to resolve to a number in this module, or the
+        # check cannot say what k the query will actually ask for.
+        resolved = globals().get(value.strip("{}"))
+        if isinstance(resolved, int):
+            literals.add(resolved)
+        else:
+            unresolved.append(value)
+    if unresolved:
+        return False, f"cannot resolve the k in {', '.join(sorted(set(unresolved)))}"
+
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.enable_load_extension(True)
+        sqlite_vec.load(probe)
+        probe.enable_load_extension(False)
+        probe.execute("CREATE VIRTUAL TABLE k_probe USING vec0(embedding float[2])")
+        probe.execute(
+            "INSERT INTO k_probe(rowid, embedding) VALUES (1, ?)",
+            (np.zeros(2, dtype=np.float32).tobytes(),),
+        )
+        query_vector = np.zeros(2, dtype=np.float32).tobytes()
+        rejected = []
+        for k in sorted(literals):
+            try:
+                probe.execute(
+                    f"SELECT rowid FROM k_probe WHERE embedding MATCH ? AND k = {k}",
+                    (query_vector,),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                rejected.append(f"k={k} ({exc})")
+        if rejected:
+            return False, (
+                "vector search silently drops these queries: " + "; ".join(rejected)
+            )
+        return True, (
+            f"{len(found)} KNN queries, {len(literals)} distinct k values accepted "
+            f"(max {max(literals)})"
+        )
+    finally:
+        probe.close()
+
+
 def _check_sqlite_vec_loadability() -> tuple[bool, str]:
     conn = sqlite3.connect(":memory:")
     try:
@@ -9037,6 +9592,8 @@ def _run_selftest() -> int:
         ("TOOL REGISTRATION", lambda: _check_tool_registration(mcp, EXPECTED_TOOL_NAMES)),
         ("DATABASE", _check_configured_database),
         ("SQLITE-VEC LOADABILITY", _check_sqlite_vec_loadability),
+        ("LEXICAL RETRIEVAL", lambda: _check_lexical_retrieval(PAPERS_DB_PATH)),
+        ("VECTOR KNN LIMITS", lambda: _check_vector_knn_limits(project_root / "server.py")),
         (
             "REFERENCED-PATH INTEGRITY",
             lambda: _check_referenced_paths(project_root),
