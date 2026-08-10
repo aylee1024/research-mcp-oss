@@ -540,6 +540,38 @@ def test_a_quotation_fully_covers_its_own_text_even_when_it_repeats_words():
     assert server._quotation_coverage(terms, repetitive) == 1.0
 
 
+def test_coverage_does_not_depend_on_the_caller_deduplicating():
+    """The measure has to be right for any caller, not only the one that dedupes."""
+    quotation = "wall thickness of the wall was 0.05 cm and the wall thickness varied"
+    passage = f"Some preamble here. {quotation}. Trailing discussion follows."
+    raw = [t.casefold() for t in server._fts5_tokenize(quotation)]
+    raw = [t for t in raw if t not in server._FTS_STOPWORDS]
+    assert len(raw) > len(set(raw)), "this quotation must repeat a word to be a test"
+    assert server._quotation_coverage(raw, passage) == 1.0
+    assert server._quotation_coverage(server._quotation_terms(quotation), passage) == 1.0
+
+
+def test_a_tie_for_best_coverage_is_reported_not_resolved_silently(library):
+    """A short quotation present verbatim in two passages cannot be ranked by coverage."""
+    connection = sqlite3.connect(library)
+    connection.execute(
+        "INSERT INTO paper_chunks (paper_id, chunk_index, chunk_text) VALUES (?,?,?)",
+        ("paper-a", 1, f"A different passage that also contains {QUOTATION} word for word."),
+    )
+    connection.commit()
+    connection.close()
+
+    result = _run(server.find_quotation(QUOTATION, fuzzy=True))
+    assert "tie for the best coverage" in result
+    assert "not a judgement" in result
+
+
+def test_a_single_best_match_is_not_flagged_as_tied(library):
+    """Scoped to one paper there is only one passage, so nothing is being tiebroken."""
+    result = _run(server.find_quotation(QUOTATION, paper_id="paper-a", fuzzy=True))
+    assert "tie for the best coverage" not in result
+
+
 def test_coverage_of_a_passage_sharing_nothing_is_zero():
     content = [t.casefold() for t in server._fts5_tokenize(QUOTATION)]
     assert server._quotation_coverage(content, "photosynthesis in deep ocean vents") == 0.0
