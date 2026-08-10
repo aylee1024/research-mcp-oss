@@ -642,5 +642,51 @@ def test_a_quotation_with_no_searchable_words_says_so(library):
     assert "no searchable words" in result
 
 
+# --- substring lookup inside one paper --------------------------------------
+
+NUL = chr(0)
+
+
+def _paper_with_a_nul(tmp_path):
+    """A page whose text carries a NUL, as extraction leaves it."""
+    database = tmp_path / "papers.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        "CREATE TABLE papers (paper_id TEXT PRIMARY KEY, title TEXT);"
+        "CREATE TABLE paper_passages ("
+        "  passage_id INTEGER PRIMARY KEY, paper_id TEXT, page_num INTEGER,"
+        "  section_header TEXT, passage_text TEXT);"
+    )
+    connection.execute("INSERT INTO papers VALUES ('p', 'A paper')")
+    connection.execute(
+        "INSERT INTO paper_passages (paper_id, page_num, passage_text) VALUES (?,?,?)",
+        ("p", 7, f"renin {NUL} angiotensin blockade reduced proteinuria markedly"),
+    )
+    connection.commit()
+    return connection
+
+
+def test_like_cannot_see_past_a_nul_but_instr_can(tmp_path):
+    """The reason the in-paper scans do not use LIKE."""
+    connection = _paper_with_a_nul(tmp_path)
+    like = connection.execute(
+        "SELECT COUNT(*) FROM paper_passages WHERE passage_text LIKE ?", ("%proteinuria%",)
+    ).fetchone()[0]
+    instr = connection.execute(
+        "SELECT COUNT(*) FROM paper_passages WHERE instr(lower(passage_text), lower(?)) > 0",
+        ("proteinuria",),
+    ).fetchone()[0]
+    connection.close()
+    assert like == 0, "if LIKE ever sees past a NUL this guard is obsolete"
+    assert instr == 1
+
+
+def test_in_paper_search_matches_the_callers_text_literally():
+    """`%` and `_` are wildcards to LIKE; this argument is documented as plain text."""
+    source = (PROJECT_ROOT / "server.py").read_text(encoding="utf-8")
+    assert "passage_text LIKE" not in source
+    assert "chunk_text LIKE" not in source
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

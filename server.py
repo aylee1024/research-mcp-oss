@@ -7777,9 +7777,10 @@ async def locate_claim_in_paper(
         if best_chunk_id is None:
             probe = claim_text[:120]
             like_rows = conn.execute(
-                "SELECT chunk_id FROM paper_chunks WHERE paper_id = ? AND chunk_text LIKE ? "
+                "SELECT chunk_id FROM paper_chunks "
+                "WHERE paper_id = ? AND instr(lower(chunk_text), lower(?)) > 0 "
                 "ORDER BY chunk_index LIMIT 1",
-                (pid, f"%{probe}%"),
+                (pid, probe),
             ).fetchall()
             if like_rows:
                 best_chunk_id = like_rows[0][0]
@@ -8616,18 +8617,24 @@ async def search_within_paper(
             return "Error: empty query."
 
         if mode == "passage":
-            # Passage (page-bounded) lookup. paper_passages has no FTS5
-            # index yet (small per-paper row count makes LIKE fast
-            # enough for in-paper scans); do a direct LIKE scan with
-            # fallback-friendly case-insensitive match. This avoids a
-            # second FTS5 table and trigger set while keeping correct
-            # pincite semantics (one row = one page).
+            # Passage (page-bounded) lookup. paper_passages has no FTS5 index
+            # (the per-paper row count is small enough to scan directly), which
+            # avoids a second index and trigger set while keeping correct
+            # pincite semantics: one row is one page.
+            #
+            # `instr`, not LIKE, for two reasons. LIKE stops matching at the
+            # first NUL byte in the text, and extraction leaves NULs in 1,247
+            # of these passages — a page whose NUL falls early is invisible to
+            # LIKE from that point on, and the tool answers "not found" for
+            # words plainly on the page. LIKE also reads `%` and `_` in the
+            # caller's text as wildcards, while this argument is documented as
+            # a plain substring; `instr` matches it literally.
             rows = conn.execute(
                 "SELECT passage_id, page_num, section_header, passage_text "
                 "FROM paper_passages "
-                "WHERE paper_id = ? AND passage_text LIKE ? "
+                "WHERE paper_id = ? AND instr(lower(passage_text), lower(?)) > 0 "
                 "ORDER BY page_num LIMIT ?",
-                (pid, f"%{q}%", limit),
+                (pid, q, limit),
             ).fetchall()
             if not rows:
                 return (
@@ -8651,9 +8658,9 @@ async def search_within_paper(
             rows = conn.execute(
                 "SELECT chunk_id, chunk_index, section_header, page_start, page_end, chunk_text "
                 "FROM paper_chunks "
-                "WHERE paper_id = ? AND chunk_text LIKE ? "
+                "WHERE paper_id = ? AND instr(lower(chunk_text), lower(?)) > 0 "
                 "ORDER BY chunk_index LIMIT ?",
-                (pid, f"%{q}%", limit),
+                (pid, q, limit),
             ).fetchall()
             if not rows:
                 return f"No chunks in '{title}' ({year}) contain '{q}'."
